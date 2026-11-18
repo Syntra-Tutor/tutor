@@ -201,7 +201,9 @@ def cmd_test(args):
 
     print(f"\n⚡ Running locked test harness for {BOLD}{problem.get('title', problem['id'])}{RESET} [{lang}]...")
     runner = TestRunner()
-    success, log, runtime_ms, metrics = runner.run_test(problem, lang=lang, submission_dir=sub_dir)
+    success, log, runtime_ms, metrics = runner.run_test(
+        problem, lang=lang, submission_dir=sub_dir, compile_timeout=args.compile_timeout
+    )
 
     print("\n" + "=" * 68)
     print(log)
@@ -725,6 +727,13 @@ def cmd_identity(args):
     return 0
 
 
+def _positive_seconds(value):
+    seconds = int(value)
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("timeout must be a positive number of seconds")
+    return seconds
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="tutor",
@@ -756,6 +765,8 @@ def main(argv=None):
     p_test.add_argument("problem_id", nargs="?", default=None, help="Problem ID (optional if inside workspace)")
     p_test.add_argument("--lang", default=None, help="Implementation language")
     p_test.add_argument("--submission-dir", default=None, help="Explicit directory containing solution to grade")
+    p_test.add_argument("--compile-timeout", type=_positive_seconds, default=25,
+                        help="Compilation timeout in seconds (default: 25; increase for emulated guests)")
     p_test.set_defaults(func=cmd_test)
 
     # submit

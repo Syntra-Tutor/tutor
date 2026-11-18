@@ -41,11 +41,14 @@ class TestRunner:
         problem: Dict[str, Any],
         lang: str = "cpp",
         submission_dir: Optional[Path] = None,
+        compile_timeout: int = 25,
     ) -> Tuple[bool, str, float, Dict[str, Any]]:
         """
         Compiles and executes the locked test harness for a problem against a user's solution.
         Returns (success: bool, output_log: str, runtime_ms: float, metrics: dict).
         """
+        if compile_timeout <= 0:
+            raise ValueError("Compilation timeout must be positive")
         prob_id = problem["id"]
         locked_prob_dir = Path(problem["dir"]) / lang
         if not locked_prob_dir.exists():
@@ -142,12 +145,12 @@ class TestRunner:
                 ]
                 try:
                     c_proc = subprocess.run(
-                        compile_cmd, cwd=str(sandbox_dir), capture_output=True, text=True, timeout=25
+                        compile_cmd, cwd=str(sandbox_dir), capture_output=True, text=True, timeout=compile_timeout
                     )
                 except subprocess.TimeoutExpired:
                     return (
                         False,
-                        "Compilation Error: Compiler timed out (> 25s) — possible infinite template instantiation or recursive macro bomb.",
+                        f"Compilation Error: Compiler timed out (> {compile_timeout}s) — possible infinite template instantiation or recursive macro bomb.",
                         0.0,
                         {"score": 0.0, "scoreboard": None},
                     )
