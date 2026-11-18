@@ -5,10 +5,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from tutor.catalog import DEFAULT_COLSPEC, ProblemCatalog, REPO_ROOT
+from tutor.ledger import append_completions, read_events
 
 DOCS_DATA_DIR = REPO_ROOT / "docs" / "data"
 LEADERBOARD_FILE = DOCS_DATA_DIR / "leaderboard.json"
-CATALOG_EXPORT_FILE = DOCS_DATA_DIR / "catalog.json"
 
 
 def compare_autolab_entries(
@@ -143,44 +143,76 @@ def recompute_global_rankings(problems_board: Dict[str, List[Dict[str, Any]]]) -
     return ranked
 
 
+def fold_events(
+    events: List[Dict[str, Any]],
+    colspecs: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+) -> Dict[str, Any]:
+    """Pure fold of completion events into the leaderboard view (no clock, no I/O)."""
+    colspecs = colspecs or {}
+    by_problem: Dict[str, List[Dict[str, Any]]] = {}
+    for event in events:
+        if event.get("type") != "completion" or float(event.get("score", 0.0)) <= 0.0:
+            continue
+        by_problem.setdefault(event["problem_id"], []).append(
+            {
+                "user": event["identity"],
+                "problem_id": event["problem_id"],
+                "lang": event.get("lang", "cpp"),
+                "score": float(event["score"]),
+                "scoreboard": event["scoreboard"],
+                "submitted_at": event["submitted_at"],
+                "commit_sha": event.get("commit_sha", "local"),
+            }
+        )
+    problems_board = {
+        prob_id: reduce_problem_scoreboard(rows, colspec=colspecs.get(prob_id, DEFAULT_COLSPEC))
+        for prob_id, rows in by_problem.items()
+    }
+    return {
+        "updated_at": max((e["submitted_at"] for e in events), default="1970-01-01T00:00:00+00:00"),
+        "events": len(events),
+        "last_event": events[-1]["hash"] if events else None,
+        "problems": problems_board,
+        "global_rankings": recompute_global_rankings(problems_board),
+    }
+
+
+def _legacy_entries(board: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [
+        {**row, "verifier": "legacy"}
+        for rows in board.get("problems", {}).values()
+        for row in sorted(rows, key=lambda r: r.get("submitted_at", ""))
+    ]
+
+
 def merge_scoreboard_entries(
     new_entries: List[Dict[str, Any]],
     leaderboard_path: Path = LEADERBOARD_FILE,
+    ledger_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
-    Merges one or more verified `scoreboard_entry` records into `leaderboard.json`,
-    re-running Autolab's `colspec` reduction per problem and updating global standings.
+    Records verified entries in the append-only completion ledger and rebuilds
+    `leaderboard.json` by replaying it. A repeated claim is ignored.
     """
+    ledger_path = Path(ledger_path) if ledger_path else Path(leaderboard_path).with_name("completions.jsonl")
     catalog = ProblemCatalog()
-    prob_map = {p["id"]: p for p in catalog.list_problems()}
+    colspecs = {p["id"]: p.get("colspec", DEFAULT_COLSPEC) for p in catalog.list_problems()}
 
-    board = load_leaderboard(leaderboard_path)
-    problems_board: Dict[str, List[Dict[str, Any]]] = board.get("problems", {})
+    if not ledger_path.exists() and Path(leaderboard_path).exists():
+        append_completions(_legacy_entries(load_leaderboard(leaderboard_path)), ledger_path)
 
-    for entry in new_entries:
-        prob_id = entry.get("problem_id")
-        if not prob_id or entry.get("scoreboard") is None or float(entry.get("score", 0.0)) <= 0.0:
-            continue
-        colspec = prob_map.get(prob_id, {}).get("colspec", DEFAULT_COLSPEC)
-        existing = problems_board.get(prob_id, [])
-        existing.append(
-            {
-                "user": entry["user"],
-                "problem_id": prob_id,
-                "lang": entry.get("lang", "cpp"),
-                "score": float(entry["score"]),
-                "scoreboard": entry["scoreboard"],
-                "submitted_at": entry.get("submitted_at") or datetime.now(timezone.utc).isoformat(),
-                "commit_sha": entry.get("commit_sha", "local"),
-            }
-        )
-        problems_board[prob_id] = reduce_problem_scoreboard(existing, colspec=colspec)
+    now = datetime.now(timezone.utc).isoformat()
+    append_completions(
+        [
+            {**entry, "submitted_at": entry.get("submitted_at") or now}
+            for entry in new_entries
+            if entry.get("problem_id") and entry.get("scoreboard") is not None and float(entry.get("score", 0.0)) > 0.0
+        ],
+        ledger_path,
+    )
 
-    board["updated_at"] = datetime.now(timezone.utc).isoformat()
-    board["problems"] = problems_board
-    board["global_rankings"] = recompute_global_rankings(problems_board)
-
-    leaderboard_path.parent.mkdir(parents=True, exist_ok=True)
+    board = fold_events(read_events(ledger_path), colspecs)
+    Path(leaderboard_path).parent.mkdir(parents=True, exist_ok=True)
     with open(leaderboard_path, "w", encoding="utf-8") as f:
         json.dump(board, f, indent=2)
 
@@ -210,100 +242,3 @@ def verify_pr_isolation(changed_files: List[str], github_actor: str) -> Tuple[bo
     return True, f"All {len(changed_files)} changed file(s) strictly isolated to {allowed_prefix}"
 
 
-def export_static_site_data() -> Tuple[Path, Path]:
-    """
-    Exports static curriculum data:
-    1. Monolithic `docs/data/catalog.json` (for offline / single-bundle execution).
-    2. Lightweight `docs/data/manifest.json` (~30 KB for instant studio boot).
-    3. Partitioned `docs/data/problems/<id>.json` chunks for on-demand lazy loading.
-    4. Initializes `docs/data/leaderboard.json` if not present.
-    """
-    DOCS_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    problems_chunk_dir = DOCS_DATA_DIR / "problems"
-    problems_chunk_dir.mkdir(parents=True, exist_ok=True)
-
-    catalog = ProblemCatalog()
-    problems = catalog.list_problems()
-
-    export_list = []
-    manifest_list = []
-
-    for p in problems:
-        prob_dir = Path(p["dir"])
-        readme_path = prob_dir / "README.md"
-        readme_text = p.get("spec") or (readme_path.read_text(encoding="utf-8") if readme_path.exists() else "")
-
-        stub_text = ""
-        harness_text = ""
-        if (prob_dir / "sh" / "solution_stub.sh").exists():
-            stub_text = (prob_dir / "sh" / "solution_stub.sh").read_text(encoding="utf-8")
-            harness_path = prob_dir / "sh" / "harness.sh"
-            harness_text = harness_path.read_text(encoding="utf-8") if harness_path.exists() else ""
-        elif (prob_dir / "cpp" / "solution_stub.hpp").exists():
-            stub_text = (prob_dir / "cpp" / "solution_stub.hpp").read_text(encoding="utf-8")
-            harness_path = prob_dir / "cpp" / "harness.cpp"
-            harness_text = harness_path.read_text(encoding="utf-8") if harness_path.exists() else ""
-
-        full_entry = {
-            "id": p["id"],
-            "title": p.get("title", p["id"]),
-            "track": p.get("track", p.get("category", "Systems")),
-            "category": p.get("category", "Systems"),
-            "difficulty": p.get("difficulty", "Medium"),
-            "depends_on": p.get("depends_on", []),
-            "colspec": p.get("colspec", DEFAULT_COLSPEC),
-            "languages": p.get("languages", ["cpp"]),
-            "tags": p.get("tags", []),
-            "spec": readme_text,
-            "readme": readme_text,
-            "stub": stub_text,
-            "harness": harness_text,
-        }
-        export_list.append(full_entry)
-
-        # Write individual problem chunk for lazy-loading
-        chunk_file = problems_chunk_dir / f"{p['id']}.json"
-        with open(chunk_file, "w", encoding="utf-8") as f:
-            json.dump(full_entry, f, indent=2)
-
-        manifest_list.append(
-            {
-                "id": p["id"],
-                "title": p.get("title", p["id"]),
-                "track": p.get("track", p.get("category", "Systems")),
-                "category": p.get("category", "Systems"),
-                "difficulty": p.get("difficulty", "Medium"),
-                "depends_on": p.get("depends_on", []),
-                "colspec": p.get("colspec", DEFAULT_COLSPEC),
-                "languages": p.get("languages", ["cpp"]),
-                "tags": p.get("tags", []),
-            }
-        )
-
-    now_iso = datetime.now(timezone.utc).isoformat()
-    payload = {
-        "generated_at": now_iso,
-        "total_problems": len(export_list),
-        "problems": export_list,
-    }
-    with open(CATALOG_EXPORT_FILE, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-
-    manifest_file = DOCS_DATA_DIR / "manifest.json"
-    with open(manifest_file, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "generated_at": now_iso,
-                "total_problems": len(manifest_list),
-                "problems": manifest_list,
-            },
-            f,
-            indent=2,
-        )
-
-    if not LEADERBOARD_FILE.exists():
-        board = load_leaderboard(LEADERBOARD_FILE)
-        with open(LEADERBOARD_FILE, "w", encoding="utf-8") as f:
-            json.dump(board, f, indent=2)
-
-    return CATALOG_EXPORT_FILE, LEADERBOARD_FILE

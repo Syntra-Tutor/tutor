@@ -34,10 +34,10 @@ class WorkspaceManager:
         # 1. Write Problem Specification
         spec_text = problem.get("spec")
         readme_src = prob_src_dir / "README.md"
+        readme_dst = target_dir / "spec.txt"
         if spec_text:
-            (target_dir / "spec.txt").write_text(spec_text, encoding="utf-8")
+            readme_dst.write_text(spec_text, encoding="utf-8")
         elif readme_src.exists():
-            readme_dst = target_dir / "spec.txt"
             shutil.copy2(readme_src, readme_dst)
 
         # 2. Check language implementation folder

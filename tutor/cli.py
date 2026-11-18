@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -9,10 +10,10 @@ from pathlib import Path
 
 from tutor import __version__
 from tutor.catalog import ProblemCatalog
+from tutor.ledger import digest_files
 from tutor.runner import TestRunner
 from tutor.scoreboard import (
     LEADERBOARD_FILE,
-    export_static_site_data,
     load_leaderboard,
     merge_scoreboard_entries,
     verify_pr_isolation,
@@ -130,6 +131,16 @@ def cmd_dag(args):
     return 0
 
 
+def synvim_installed():
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return (config_home / "nvim" / "lua" / "synvim").is_dir()
+
+
+def resolve_editor():
+    """Synvim (nvim) by default; deliberately ignores $EDITOR so problems open in one controlled editor."""
+    return os.environ.get("TUTOR_EDITOR") or get_config().get("editor") or "nvim"
+
+
 def cmd_pick(args):
     catalog = ProblemCatalog()
     problem = catalog.get_problem(args.problem_id)
@@ -159,9 +170,11 @@ def cmd_pick(args):
     print(f"  • Solution : {BOLD}{GREEN}{solution_path}{RESET}\n")
 
     if not args.no_edit:
-        editor = os.environ.get("EDITOR", "nvim")
+        editor = resolve_editor()
+        if editor == "nvim" and not synvim_installed():
+            print(f"{YELLOW}⚠ Synvim is not installed; opening plain nvim. Install it with synvim/setup.sh.{RESET}")
         print(f"{DIM}Opening {editor} {solution_path}...{RESET}\n")
-        os.system(f"{editor} '{solution_path}'")
+        subprocess.call([*shlex.split(editor), str(solution_path)])
 
     return 0
 
@@ -201,7 +214,10 @@ def cmd_test(args):
 
     print(f"\n⚡ Running locked test harness for {BOLD}{problem.get('title', problem['id'])}{RESET} [{lang}]...")
     runner = TestRunner()
-    success, log, runtime_ms, metrics = runner.run_test(problem, lang=lang, submission_dir=sub_dir)
+    success, log, runtime_ms, metrics = runner.run_test(
+        problem, lang=lang, submission_dir=sub_dir, compile_timeout=args.compile_timeout,
+        remote=getattr(args, "remote", None),
+    )
 
     print("\n" + "=" * 68)
     print(log)
@@ -284,6 +300,8 @@ def cmd_submit(args):
                     "score": metrics["score"],
                     "scoreboard": metrics["scoreboard"],
                     "submitted_at": datetime.now(timezone.utc).isoformat(),
+                    "problem_hash": problem_digest(problem),
+                    "solution_sha256": digest_files([sol_src]),
                 }
             ]
         )
@@ -294,6 +312,12 @@ def cmd_submit(args):
     print(f"  • Scoreboard : Score={vec[0]:.1f}, Cycles/Op={vec[1]:.2f}, Bytes={vec[2]} B")
     print(f"  • Next Step  : {DIM}git add submissions/{user}/{problem['id']} && git commit -m 'solve {problem['id']}' && git push{RESET}\n")
     return 0
+
+
+def problem_digest(problem):
+    """Binds a claim to the exact problem and locked harness it was graded against."""
+    root = Path(problem["dir"])
+    return digest_files((p for p in root.rglob("*") if p.is_file()), root=root)
 
 
 def cmd_scoreboard(args):
@@ -416,6 +440,11 @@ def cmd_ci_grade_pr(args):
                     "scoreboard": metrics["scoreboard"],
                     "submitted_at": datetime.now(timezone.utc).isoformat(),
                     "commit_sha": args.commit_sha or "pr",
+                    "problem_hash": problem_digest(prob),
+                    "solution_sha256": digest_files(
+                        p for p in Path(sub_dir).iterdir() if p.name.startswith("solution")
+                    ),
+                    "verifier": "ci",
                 }
             )
 
@@ -477,121 +506,7 @@ def cmd_ci_merge_scoreboard(args):
         return 0
 
     board = merge_scoreboard_entries(entries)
-    export_static_site_data()
     print(f"{GREEN}✓ Merged {len(entries)} entry/entries into {LEADERBOARD_FILE}. Global ranked users: {len(board.get('global_rankings', []))}{RESET}")
-    return 0
-
-
-def cmd_export_pages(args):
-    cat_path, board_path = export_static_site_data()
-    print(f"{GREEN}✓ Exported GitHub Pages data:{RESET}")
-    print(f"  • Catalog     : {CYAN}{cat_path}{RESET}")
-    print(f"  • Leaderboard : {CYAN}{board_path}{RESET}")
-    return 0
-
-
-def cmd_serve(args):
-    """
-    Serves the Neovim WASM Studio + Skill-Tree DAG + Autolab Scoreboard (`docs/`) locally
-    and exposes `/api/judge` for sub-100ms local `g++ -O3 -std=c++20` execution.
-    """
-    import http.server
-    import tempfile
-
-    export_static_site_data()
-    docs_dir = REPO_ROOT / "docs"
-    port = int(getattr(args, "port", 8080))
-
-    class TutorStudioHandler(http.server.SimpleHTTPRequestHandler):
-        def __init__(self, *h_args, **h_kwargs):
-            super().__init__(*h_args, directory=str(docs_dir), **h_kwargs)
-
-        def do_POST(self):
-            if self.path == "/api/judge":
-                length = int(self.headers.get("Content-Length", "0"))
-                raw = self.rfile.read(length).decode("utf-8")
-                try:
-                    req = json.loads(raw)
-                    prob_id = req.get("problem_id", "")
-                    code = req.get("code", "")
-                    user = req.get("user") or os.environ.get("USER", "local-user")
-                    catalog = ProblemCatalog()
-                    prob = catalog.get_problem(prob_id)
-                    if not prob:
-                        self._send_json(404, {"ok": False, "log": f"Problem '{prob_id}' not found."})
-                        return
-
-                    lang = req.get("lang")
-                    if not lang:
-                        lang = "sh" if "sh" in prob.get("languages", []) else "cpp"
-                    sol_filename = "solution.sh" if lang == "sh" else "solution.hpp"
-
-                    with tempfile.TemporaryDirectory(prefix="tutor_web_") as tmp_dir:
-                        sol_path = Path(tmp_dir) / sol_filename
-                        sol_path.write_text(code, encoding="utf-8")
-                        if lang == "sh":
-                            sol_path.chmod(0o755)
-                        runner = TestRunner()
-                        success, log, runtime_ms, metrics = runner.run_test(
-                            prob, lang=lang, submission_dir=Path(tmp_dir)
-                        )
-                        is_submission = bool(req.get("is_submission", False))
-                        if success and is_submission:
-                            from tutor.state import mark_solved
-                            mark_solved(
-                                prob["id"],
-                                lang,
-                                runtime_ms=runtime_ms,
-                                cycles_per_op=metrics.get("cycles_per_op", 0.0),
-                                code_bytes=metrics.get("code_bytes", 0),
-                            )
-                            if req.get("update_board", True):
-                                merge_scoreboard_entries(
-                                    [
-                                        {
-                                            "user": user,
-                                            "problem_id": prob["id"],
-                                            "lang": lang,
-                                            "score": metrics["score"],
-                                            "scoreboard": metrics["scoreboard"],
-                                            "submitted_at": datetime.now(timezone.utc).isoformat(),
-                                        }
-                                    ]
-                                )
-                        self._send_json(
-                            200,
-                            {
-                                "ok": success,
-                                "is_submission": is_submission,
-                                "log": log,
-                                "runtime_ms": round(runtime_ms, 2),
-                                "metrics": metrics,
-                                "engine": "local-g++",
-                            },
-                        )
-                except Exception as exc:
-                    self._send_json(500, {"ok": False, "log": f"Server error: {exc}"})
-            else:
-                self.send_error(404)
-
-        def _send_json(self, status_code: int, payload: dict):
-            data = json.dumps(payload).encode("utf-8")
-            self.send_response(status_code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-    host = getattr(args, "host", "127.0.0.1")
-    print(f"\n{BOLD}{CYAN}=== SYNTRA TUTOR — NEOVIM WASM STUDIO & LOCAL JUDGE ==={RESET}")
-    print(f"  • Studio URL : {GREEN}{BOLD}http://{host}:{port}{RESET}")
-    print(f"  • Editor     : Genuine Neovim WebAssembly (:w, :Run, <Space>r, <F5>)")
-    print(f"  • Judge      : Local g++ -O3 -std=c++20 (/api/judge) + Cloud Godbolt Fallback\n")
-    with http.server.ThreadingHTTPServer((host, port), TutorStudioHandler) as httpd:
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            print("\nShutting down studio server.")
     return 0
 
 
@@ -725,6 +640,13 @@ def cmd_identity(args):
     return 0
 
 
+def _positive_seconds(value):
+    seconds = int(value)
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("timeout must be a positive number of seconds")
+    return seconds
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="tutor",
@@ -747,7 +669,7 @@ def main(argv=None):
     p_pick = subparsers.add_parser("pick", help="Scaffold and open a problem solution in editor")
     p_pick.add_argument("problem_id", help="Problem ID (e.g. 002, 2, or 002-hypervector-hamming)")
     p_pick.add_argument("--lang", default=None, help="Implementation language (cpp, rust, python)")
-    p_pick.add_argument("--no-edit", action="store_true", help="Do not launch editor automatically")
+    p_pick.add_argument("--no-edit", action="store_true", help="Do not open Synvim automatically")
     p_pick.add_argument("--force", action="store_true", help="Bypass prerequisite lock check")
     p_pick.set_defaults(func=cmd_pick)
 
@@ -756,6 +678,11 @@ def main(argv=None):
     p_test.add_argument("problem_id", nargs="?", default=None, help="Problem ID (optional if inside workspace)")
     p_test.add_argument("--lang", default=None, help="Implementation language")
     p_test.add_argument("--submission-dir", default=None, help="Explicit directory containing solution to grade")
+    p_test.add_argument("--compile-timeout", type=_positive_seconds, default=25,
+                        help="Compilation timeout in seconds (default: 25; increase for emulated guests)")
+    p_test.add_argument("--remote", choices=("godbolt", "bridge"), default=None,
+                        help="Compile and run on Compiler Explorer instead of local g++ "
+                             "(bridge: via the hosting page, for the browser VM)")
     p_test.set_defaults(func=cmd_test)
 
     # submit
@@ -770,16 +697,6 @@ def main(argv=None):
     p_board = subparsers.add_parser("scoreboard", aliases=["board"], help="Display Autolab Scoreboard rankings")
     p_board.add_argument("-p", "--problem", default=None, help="Show multi-metric scoreboard for a specific problem")
     p_board.set_defaults(func=cmd_scoreboard)
-
-    # export-pages
-    p_exp = subparsers.add_parser("export-pages", help="Export catalog.json and leaderboard.json for GitHub Pages")
-    p_exp.set_defaults(func=cmd_export_pages)
-
-    # serve
-    p_srv = subparsers.add_parser("serve", aliases=["web", "studio"], help="Launch Neovim WASM Studio + Local C++20 Judge in browser")
-    p_srv.add_argument("-p", "--port", type=int, default=8080, help="HTTP port (default: 8080)")
-    p_srv.add_argument("--host", default="127.0.0.1", help="Host interface to bind to (default: 127.0.0.1 for local security)")
-    p_srv.set_defaults(func=cmd_serve)
 
     # ci-grade-pr
     p_cigrade = subparsers.add_parser("ci-grade-pr", help="CI Workflow 1: Verify PR isolation and grade submissions")
