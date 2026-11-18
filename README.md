@@ -1,7 +1,9 @@
-Open the [Production Web Studio](https://syntra-labs.github.io/tutor/), preview the [Dev Web Studio](https://syntra-labs.github.io/tutor/dev/), or run `tutor serve` to test locally at [http://localhost:8080](http://localhost:8080). Solve problems. Score higher in the leaderboard.
+[Dev Web Studio](https://syntra-labs.github.io/tutor/dev/)
 
-<div align="center">
-
-<img src="docs/architecture/tutor_architecture.svg" width="100%" alt="Syntra Tutor Architecture" />
-
-</div>
+```
+Yeah, so, the realization is, just fucking code. 
+Write tests, and code.
+Write theorems, then prove them.
+Write declarative specifications, and check them.
+And make sure you bundle both together.
+```
