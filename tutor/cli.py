@@ -818,13 +818,77 @@ def cmd_watch(args):
     return 0
 
 
+
+# --- syntra self-hosted CLI patch ---
+def _print_learner_help(topic=None):
+    """Practice loop + authoring. Grading is local (your machine is the server)."""
+    if topic:
+        return main([topic, "-h"])
+    print(f"""{BOLD}{CYAN}Syntra Tutor{RESET} — systems problems, graded on your machine.
+
+{BOLD}Practice{RESET}
+  tutor list [--track NAME]    browse problems
+  tutor pick <id>              scaffold + open editor
+  tutor test [id]              run locked harness locally
+  tutor submit [id]            stage a passing solution
+  tutor scoreboard             rankings (local / host ledger)
+  tutor status                 progress
+  tutor pull                   refresh problem sets
+  tutor dag                    prerequisite tree
+  tutor identity               handle / preferences
+
+{BOLD}Authoring{RESET}
+  tutor new <slug>             scaffold a new problem
+  tutor validate [id]          check problem.json
+  tutor watch                  live-validate on save
+
+{BOLD}Host grading{RESET}
+  # grade someone else's tree without checking out a PR:
+  tutor test <id> --submission-dir /path/to/their/solution
+
+{BOLD}Also{RESET}
+  tutor help <cmd>             detailed help for one command
+  tutor -h                     full argparse listing
+
+Ids accept short or long forms. Omit id on test/submit to use the workspace.
+""")
+    return 0
+
+
 def main(argv=None):
+
+    raw = list(argv) if argv is not None else sys.argv[1:]
+    if raw and raw[0] in ("help", "h"):
+        return _print_learner_help(raw[1] if len(raw) > 1 else None)
+
     parser = argparse.ArgumentParser(
         prog="tutor",
-        description="Code-Tutor — Sovereign Systems, Math & Geometry Problem Runner + Autolab Scoreboard",
+        description=(
+            "Syntra Tutor — practice systems problems. "
+            "Graded locally (your machine is the server). "
+            "Core: list → pick → test → submit → scoreboard."
+        ),
+        epilog=(
+            "tutor help  — short overview. "
+            "Grade a received submission: "
+            "tutor test <id> --submission-dir /path/to/solution"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("-v", "--version", action="version", version=f"tutor {__version__}")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    p_help = subparsers.add_parser(
+        "help", aliases=["h"],
+        help="Short overview (practice + authoring + host grading)",
+    )
+    p_help.add_argument(
+        "topic", nargs="?", default=None,
+        help="Optional command for detailed help",
+    )
+    p_help.set_defaults(func=lambda a: _print_learner_help(getattr(a, "topic", None)))
+
+
 
     # list
     p_list = subparsers.add_parser("list", aliases=["ls"], help="List available problem sets and DAG unlock status")
@@ -866,46 +930,16 @@ def main(argv=None):
     p_board.add_argument("-p", "--problem", default=None, help="Show multi-metric scoreboard for a specific problem")
     p_board.set_defaults(func=cmd_scoreboard)
 
-    # ci-grade-pr
-    p_cigrade = subparsers.add_parser("ci-grade-pr", help="CI Workflow 1: Verify PR isolation and grade submissions")
-    p_cigrade.add_argument("--user", required=True, help="GitHub actor username")
-    p_cigrade.add_argument("--commit-sha", default="", help="Commit SHA")
-    p_cigrade.add_argument("--output", default="scoreboard_entries.json", help="Output JSON artifact path")
-    p_cigrade.add_argument("changed_files", nargs="*", help="List of files modified in the PR")
-    p_cigrade.set_defaults(func=cmd_ci_grade_pr)
 
-    # ci-merge-scoreboard
-    p_cimerge = subparsers.add_parser("ci-merge-scoreboard", help="CI Workflow 2: Merge verified artifact into leaderboard.json")
-    p_cimerge.add_argument("--input", required=True, help="Path to scoreboard_entries.json artifact")
-    p_cimerge.set_defaults(func=cmd_ci_merge_scoreboard)
 
     # pull
     p_pull = subparsers.add_parser("pull", aliases=["sync"], help="Pull updated problem sets & tests from remote")
     p_pull.add_argument("remote", nargs="?", default=None, help="Optional remote repository URL")
     p_pull.set_defaults(func=cmd_pull)
 
-    # connect
-    p_conn = subparsers.add_parser("connect", help="Connect to an optional distributed cluster/node")
-    p_conn.add_argument("endpoint", help="Distributed node endpoint")
-    p_conn.set_defaults(func=cmd_connect)
 
-    # slice
-    p_slice = subparsers.add_parser("slice", help="Clean-room contract slicer: extract problem stub from real code")
-    p_slice.add_argument("file", help="Source file to slice (C++, Rust, Python)")
-    p_slice.add_argument("-o", "--output", help="Output file path for stub")
-    p_slice.set_defaults(func=cmd_slice)
 
-    # lint
-    p_lint = subparsers.add_parser("lint", help="Lint task contracts and verification obligations")
-    p_lint.add_argument("root", nargs="?", default=".", help="Root directory to scan")
-    p_lint.set_defaults(func=cmd_lint)
 
-    # verify-policy
-    p_policy = subparsers.add_parser("verify-policy", help="Enforce active OPA Rego architecture policies (policy/architecture.rego)")
-    p_policy.add_argument("--actor", default="local-actor", help="GitHub handle of contributor")
-    p_policy.add_argument("--pr-files", nargs="*", default=[], help="List of modified files to validate")
-    p_policy.add_argument("--audit-markdown", action="store_true", help="Audit repository for ARCH-001 markdown prohibitions and migration targets")
-    p_policy.set_defaults(func=cmd_verify_policy)
 
     # status
     p_stat = subparsers.add_parser("status", help="Show workspace status and solved metrics")
