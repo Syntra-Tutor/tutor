@@ -15,13 +15,28 @@ DEFAULT_COLSPEC = [
 ]
 
 
+def _normalize_meta(meta: Dict[str, Any], prob_dir: Path) -> Dict[str, Any]:
+    meta["dir"] = str(prob_dir)
+    meta.setdefault("depends_on", [])
+    if not meta.get("colspec"):
+        meta["colspec"] = DEFAULT_COLSPEC
+    meta.setdefault("track", meta.get("category", "Systems"))
+    return meta
+
+
 class ProblemCatalog:
-    """Discovers, indexes, and resolves prerequisite DAGs for available problem sets."""
+    """Discovers, indexes, and resolves prerequisite DAGs for available problem sets.
+
+    Uses an incremental SQLite index (``tutor.db.CatalogIndex``, issue #39) to
+    avoid rescanning/parsing every ``problem.json`` on each invocation. The
+    on-disk JSON files remain the source of truth; if the database layer is
+    unavailable we transparently fall back to a direct filesystem scan.
+    """
 
     def __init__(self):
         self.search_paths = [BUILTIN_PROBLEMS, USER_PROBLEMS]
 
-    def list_problems(self) -> List[Dict[str, Any]]:
+    def _scan_filesystem(self) -> List[Dict[str, Any]]:
         problems = []
         seen_ids = set()
 
@@ -41,16 +56,35 @@ class ProblemCatalog:
                     if pid in seen_ids:
                         continue
                     seen_ids.add(pid)
-                    meta["dir"] = str(prob_dir)
-                    meta["solved"] = is_solved(pid)
-                    meta.setdefault("depends_on", [])
-                    meta.setdefault("colspec", DEFAULT_COLSPEC)
-                    meta.setdefault("track", meta.get("category", "Systems"))
+                    _normalize_meta(meta, prob_dir)
                     problems.append(meta)
                 except Exception:
                     continue
 
         problems.sort(key=lambda x: x.get("id", ""))
+        return problems
+
+    def _load_indexed(self) -> Optional[List[Dict[str, Any]]]:
+        try:
+            from tutor.db import CatalogIndex
+
+            index = CatalogIndex()
+            index.sync(self.search_paths)
+            problems = index.all_problems()
+            index.close()
+            for p in problems:
+                _normalize_meta(p, Path(p["dir"]))
+            return problems
+        except Exception:
+            return None
+
+    def list_problems(self) -> List[Dict[str, Any]]:
+        problems = self._load_indexed()
+        if problems is None:
+            problems = self._scan_filesystem()
+
+        for p in problems:
+            p["solved"] = is_solved(p.get("id", ""))
 
         # Resolve DAG unlock status
         solved_map = {p["id"]: p["solved"] for p in problems}

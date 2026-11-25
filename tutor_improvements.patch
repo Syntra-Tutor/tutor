@@ -1,0 +1,1092 @@
+diff --git a/tutor/catalog.py b/tutor/catalog.py
+--- a/tutor/catalog.py
++++ b/tutor/catalog.py
+@@ -15,13 +15,28 @@
+ ]
+ 
+ 
++def _normalize_meta(meta: Dict[str, Any], prob_dir: Path) -> Dict[str, Any]:
++    meta["dir"] = str(prob_dir)
++    meta.setdefault("depends_on", [])
++    if not meta.get("colspec"):
++        meta["colspec"] = DEFAULT_COLSPEC
++    meta.setdefault("track", meta.get("category", "Systems"))
++    return meta
++
++
+ class ProblemCatalog:
+-    """Discovers, indexes, and resolves prerequisite DAGs for available problem sets."""
++    """Discovers, indexes, and resolves prerequisite DAGs for available problem sets.
++
++    Uses an incremental SQLite index (``tutor.db.CatalogIndex``, issue #39) to
++    avoid rescanning/parsing every ``problem.json`` on each invocation. The
++    on-disk JSON files remain the source of truth; if the database layer is
++    unavailable we transparently fall back to a direct filesystem scan.
++    """
+ 
+     def __init__(self):
+         self.search_paths = [BUILTIN_PROBLEMS, USER_PROBLEMS]
+ 
+-    def list_problems(self) -> List[Dict[str, Any]]:
++    def _scan_filesystem(self) -> List[Dict[str, Any]]:
+         problems = []
+         seen_ids = set()
+ 
+@@ -41,16 +56,35 @@
+                     if pid in seen_ids:
+                         continue
+                     seen_ids.add(pid)
+-                    meta["dir"] = str(prob_dir)
+-                    meta["solved"] = is_solved(pid)
+-                    meta.setdefault("depends_on", [])
+-                    meta.setdefault("colspec", DEFAULT_COLSPEC)
+-                    meta.setdefault("track", meta.get("category", "Systems"))
++                    _normalize_meta(meta, prob_dir)
+                     problems.append(meta)
+                 except Exception:
+                     continue
+ 
+         problems.sort(key=lambda x: x.get("id", ""))
++        return problems
++
++    def _load_indexed(self) -> Optional[List[Dict[str, Any]]]:
++        try:
++            from tutor.db import CatalogIndex
++
++            index = CatalogIndex()
++            index.sync(self.search_paths)
++            problems = index.all_problems()
++            index.close()
++            for p in problems:
++                _normalize_meta(p, Path(p["dir"]))
++            return problems
++        except Exception:
++            return None
++
++    def list_problems(self) -> List[Dict[str, Any]]:
++        problems = self._load_indexed()
++        if problems is None:
++            problems = self._scan_filesystem()
++
++        for p in problems:
++            p["solved"] = is_solved(p.get("id", ""))
+ 
+         # Resolve DAG unlock status
+         solved_map = {p["id"]: p["solved"] for p in problems}
+diff --git a/tutor/cli.py b/tutor/cli.py
+--- a/tutor/cli.py
++++ b/tutor/cli.py
+@@ -14,6 +14,7 @@
+ from tutor.runner import TestRunner
+ from tutor.scoreboard import (
+     LEADERBOARD_FILE,
++    export_static_site_data,
+     load_leaderboard,
+     merge_scoreboard_entries,
+     verify_pr_isolation,
+@@ -36,6 +37,18 @@
+ LGCC_BIN = REPO_ROOT / "bin" / "lgcc"
+ 
+ 
++
++def resolve_editor():
++    """Prefer $VISUAL / $EDITOR, then tutor config, then plain vim."""
++    return (
++        os.environ.get("VISUAL")
++        or os.environ.get("EDITOR")
++        or os.environ.get("TUTOR_EDITOR")
++        or get_config().get("editor")
++        or "vim"
++    )
++
++
+ def cmd_list(args):
+     catalog = ProblemCatalog()
+     problems = catalog.list_problems()
+@@ -131,16 +144,6 @@
+     return 0
+ 
+ 
+-def synvim_installed():
+-    config_home = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+-    return (config_home / "nvim" / "lua" / "synvim").is_dir()
+-
+-
+-def resolve_editor():
+-    """Synvim (nvim) by default; deliberately ignores $EDITOR so problems open in one controlled editor."""
+-    return os.environ.get("TUTOR_EDITOR") or get_config().get("editor") or "nvim"
+-
+-
+ def cmd_pick(args):
+     catalog = ProblemCatalog()
+     problem = catalog.get_problem(args.problem_id)
+@@ -171,8 +174,6 @@
+ 
+     if not args.no_edit:
+         editor = resolve_editor()
+-        if editor == "nvim" and not synvim_installed():
+-            print(f"{YELLOW}⚠ Synvim is not installed; opening plain nvim. Install it with synvim/setup.sh.{RESET}")
+         print(f"{DIM}Opening {editor} {solution_path}...{RESET}\n")
+         subprocess.call([*shlex.split(editor), str(solution_path)])
+ 
+@@ -215,7 +216,7 @@
+     print(f"\n⚡ Running locked test harness for {BOLD}{problem.get('title', problem['id'])}{RESET} [{lang}]...")
+     runner = TestRunner()
+     success, log, runtime_ms, metrics = runner.run_test(
+-        problem, lang=lang, submission_dir=sub_dir, compile_timeout=args.compile_timeout,
++        problem, lang=lang, submission_dir=sub_dir, compile_timeout=getattr(args, "compile_timeout", 25),
+         remote=getattr(args, "remote", None),
+     )
+ 
+@@ -440,11 +441,6 @@
+                     "scoreboard": metrics["scoreboard"],
+                     "submitted_at": datetime.now(timezone.utc).isoformat(),
+                     "commit_sha": args.commit_sha or "pr",
+-                    "problem_hash": problem_digest(prob),
+-                    "solution_sha256": digest_files(
+-                        p for p in Path(sub_dir).iterdir() if p.name.startswith("solution")
+-                    ),
+-                    "verifier": "ci",
+                 }
+             )
+ 
+@@ -506,10 +502,124 @@
+         return 0
+ 
+     board = merge_scoreboard_entries(entries)
++    export_static_site_data()
+     print(f"{GREEN}✓ Merged {len(entries)} entry/entries into {LEADERBOARD_FILE}. Global ranked users: {len(board.get('global_rankings', []))}{RESET}")
+     return 0
+ 
+ 
++def cmd_export_pages(args):
++    cat_path, board_path = export_static_site_data()
++    print(f"{GREEN}✓ Exported GitHub Pages data:{RESET}")
++    print(f"  • Catalog     : {CYAN}{cat_path}{RESET}")
++    print(f"  • Leaderboard : {CYAN}{board_path}{RESET}")
++    return 0
++
++
++def cmd_serve(args):
++    """
++    Serves the Neovim WASM Studio + Skill-Tree DAG + Autolab Scoreboard (`docs/`) locally
++    and exposes `/api/judge` for sub-100ms local `g++ -O3 -std=c++20` execution.
++    """
++    import http.server
++    import tempfile
++
++    export_static_site_data()
++    docs_dir = REPO_ROOT / "docs"
++    port = int(getattr(args, "port", 8080))
++
++    class TutorStudioHandler(http.server.SimpleHTTPRequestHandler):
++        def __init__(self, *h_args, **h_kwargs):
++            super().__init__(*h_args, directory=str(docs_dir), **h_kwargs)
++
++        def do_POST(self):
++            if self.path == "/api/judge":
++                length = int(self.headers.get("Content-Length", "0"))
++                raw = self.rfile.read(length).decode("utf-8")
++                try:
++                    req = json.loads(raw)
++                    prob_id = req.get("problem_id", "")
++                    code = req.get("code", "")
++                    user = req.get("user") or os.environ.get("USER", "local-user")
++                    catalog = ProblemCatalog()
++                    prob = catalog.get_problem(prob_id)
++                    if not prob:
++                        self._send_json(404, {"ok": False, "log": f"Problem '{prob_id}' not found."})
++                        return
++
++                    lang = req.get("lang")
++                    if not lang:
++                        lang = "sh" if "sh" in prob.get("languages", []) else "cpp"
++                    sol_filename = "solution.sh" if lang == "sh" else "solution.hpp"
++
++                    with tempfile.TemporaryDirectory(prefix="tutor_web_") as tmp_dir:
++                        sol_path = Path(tmp_dir) / sol_filename
++                        sol_path.write_text(code, encoding="utf-8")
++                        if lang == "sh":
++                            sol_path.chmod(0o755)
++                        runner = TestRunner()
++                        success, log, runtime_ms, metrics = runner.run_test(
++                            prob, lang=lang, submission_dir=Path(tmp_dir)
++                        )
++                        is_submission = bool(req.get("is_submission", False))
++                        if success and is_submission:
++                            from tutor.state import mark_solved
++                            mark_solved(
++                                prob["id"],
++                                lang,
++                                runtime_ms=runtime_ms,
++                                cycles_per_op=metrics.get("cycles_per_op", 0.0),
++                                code_bytes=metrics.get("code_bytes", 0),
++                            )
++                            if req.get("update_board", True):
++                                merge_scoreboard_entries(
++                                    [
++                                        {
++                                            "user": user,
++                                            "problem_id": prob["id"],
++                                            "lang": lang,
++                                            "score": metrics["score"],
++                                            "scoreboard": metrics["scoreboard"],
++                                            "submitted_at": datetime.now(timezone.utc).isoformat(),
++                                        }
++                                    ]
++                                )
++                        self._send_json(
++                            200,
++                            {
++                                "ok": success,
++                                "is_submission": is_submission,
++                                "log": log,
++                                "runtime_ms": round(runtime_ms, 2),
++                                "metrics": metrics,
++                                "engine": "local-g++",
++                            },
++                        )
++                except Exception as exc:
++                    self._send_json(500, {"ok": False, "log": f"Server error: {exc}"})
++            else:
++                self.send_error(404)
++
++        def _send_json(self, status_code: int, payload: dict):
++            data = json.dumps(payload).encode("utf-8")
++            self.send_response(status_code)
++            self.send_header("Content-Type", "application/json")
++            self.send_header("Content-Length", str(len(data)))
++            self.end_headers()
++            self.wfile.write(data)
++
++    host = getattr(args, "host", "127.0.0.1")
++    print(f"\n{BOLD}{CYAN}=== SYNTRA TUTOR — NEOVIM WASM STUDIO & LOCAL JUDGE ==={RESET}")
++    print(f"  • Studio URL : {GREEN}{BOLD}http://{host}:{port}{RESET}")
++    print(f"  • Editor     : Genuine Neovim WebAssembly (:w, :Run, <Space>r, <F5>)")
++    print(f"  • Judge      : Local g++ -O3 -std=c++20 (/api/judge) + Cloud Godbolt Fallback\n")
++    with http.server.ThreadingHTTPServer((host, port), TutorStudioHandler) as httpd:
++        try:
++            httpd.serve_forever()
++        except KeyboardInterrupt:
++            print("\nShutting down studio server.")
++    return 0
++
++
+ def cmd_pull(args):
+     sync = SyncManager()
+     remote = args.remote
+@@ -640,11 +750,185 @@
+     return 0
+ 
+ 
+-def _positive_seconds(value):
+-    seconds = int(value)
+-    if seconds <= 0:
+-        raise argparse.ArgumentTypeError("timeout must be a positive number of seconds")
+-    return seconds
++def _validate_targets(targets, quiet_ok: bool = False):
++    """Shared validation core for `tutor validate` and `tutor watch`.
++
++    Returns (total_errors, checked_count).
++    """
++    from tutor.template import validate_meta
++
++    known_ids = {p["id"] for p in ProblemCatalog().list_problems()}
++    total_errors = 0
++    for prob_dir in targets:
++        meta_file = prob_dir / "problem.json"
++        try:
++            meta = json.loads(meta_file.read_text())
++        except Exception as e:
++            print(f"{RED}✗ {prob_dir.name}: unreadable problem.json ({e}){RESET}")
++            total_errors += 1
++            continue
++        errors = validate_meta(meta)
++        # Cross-check: depends_on must reference existing problems
++        for dep in meta.get("depends_on", []):
++            if dep not in known_ids:
++                errors.append(f"depends_on references unknown problem id {dep!r}")
++        if errors:
++            total_errors += len(errors)
++            print(f"{RED}✗ {prob_dir.name}:{RESET}")
++            for err in errors:
++                print(f"    - {err}")
++        elif not quiet_ok:
++            print(f"{GREEN}✓ {prob_dir.name}{RESET}")
++    return total_errors, len(targets)
++
++
++def cmd_new(args):
++    """Scaffold a new problem from the canonical template (issue #36)."""
++    from tutor.template import (
++        PROBLEMS_DIR,
++        normalize_problem_id,
++        scaffold_problem,
++    )
++
++    raw = args.problem_id or args.slug
++    if not raw:
++        print(f"{YELLOW}No problem name given — starting interactive wizard.{RESET}")
++        raw = input("  slug or id (e.g. lockfree-stack): ").strip()
++        if not raw:
++            print(f"{RED}Error: a slug or problem id is required.{RESET}")
++            return 1
++        title = input("  title (blank = derived from slug): ").strip() or None
++        diff_in = input("  difficulty [Easy/Medium/Hard] (default Medium): ").strip()
++        difficulty = diff_in.title() if diff_in else "Medium"
++        if difficulty not in ("Easy", "Medium", "Hard"):
++            print(f"{RED}Error: invalid difficulty {diff_in!r}.{RESET}")
++            return 1
++        category = input("  category (blank = Systems): ").strip()
++        tags_in = input("  tags (space-separated, optional): ").strip()
++        deps_in = input("  depends-on ids (space-separated, optional): ").strip()
++        args = argparse.Namespace(**{**vars(args), "difficulty": difficulty,
++                                     "category": category,
++                                     "tags": tags_in.split() if tags_in else [],
++                                     "depends_on": deps_in.split() if deps_in else []})
++    else:
++        title = args.title
++
++    try:
++        problem_id = normalize_problem_id(raw)
++    except ValueError as e:
++        print(f"{RED}Error: {e}{RESET}")
++        return 1
++
++    title = title or problem_id.split("-", 1)[-1].replace("-", " ").title()
++
++    try:
++        prob_dir = scaffold_problem(
++            problem_id,
++            title,
++            difficulty=args.difficulty,
++            category=args.category,
++            track=args.track,
++            tags=args.tags,
++            depends_on=args.depends_on,
++        )
++    except (ValueError, FileExistsError) as e:
++        print(f"{RED}Error: {e}{RESET}")
++        return 1
++
++    # Validate immediately so authors never start from a broken scaffold,
++    # and force the SQLite index to pick up the new problem right away.
++    errors, _ = _validate_targets([prob_dir], quiet_ok=True)
++
++    print(f"\n{GREEN}✓ Created {BOLD}{problem_id}{RESET}  ({args.difficulty}, {errors} schema issue(s))")
++    print(f"  • {prob_dir.relative_to(REPO_ROOT)}/")
++    print(f"      problem.json           ← metadata + spec (edit me)")
++    print(f"      cpp/solution_stub.hpp  ← API skeleton students receive")
++    print(f"      cpp/solution.hpp       ← compiles green out of the box")
++    print(f"      cpp/harness.cpp        ← locked judge — add assertions")
++    print(f"      cpp/Makefile           ← make test compiles & runs the harness")
++    if errors:
++        print(f"\n{RED}Fix these before committing:{RESET}")
++        for err in errors:
++            print(f"    - {err}")
++        return 1
++    print(f"\n  Next: write the spec in problem.json, add harness assertions, then:")
++    print(f"        {DIM}make -C {prob_dir.relative_to(REPO_ROOT)}/cpp test   # compile+run harness{RESET}")
++    print(f"        {DIM}tutor validate {problem_id}                    # schema + DAG check{RESET}")
++    print(f"        {DIM}tutor watch                                # live re-validate on save{RESET}")
++    return 0
++
++
++def cmd_validate(args):
++    """Validate problem.json files against the canonical schema (issue #36)."""
++    from tutor.template import PROBLEMS_DIR
++
++    if args.problem_id:
++        catalog = ProblemCatalog()
++        problem = catalog.get_problem(args.problem_id)
++        if not problem:
++            print(f"{RED}Error: Problem '{args.problem_id}' not found.{RESET}")
++            return 1
++        targets = [Path(problem["dir"])]
++    else:
++        targets = sorted(
++            d for d in PROBLEMS_DIR.iterdir()
++            if d.is_dir() and (d / "problem.json").exists()
++        )
++
++    total_errors, count = _validate_targets(targets)
++    if total_errors:
++        print(f"\n{RED}{total_errors} validation error(s) across {count} problem(s).{RESET}")
++        return 1
++    print(f"\n{GREEN}All {count} problem(s) valid.{RESET}")
++    return 0
++
++
++def cmd_watch(args):
++    """Live-validate the problems tree on file changes (author workflow)."""
++    from tutor.template import PROBLEMS_DIR, Watcher
++
++    watch_dir = Path(args.dir).resolve() if getattr(args, "dir", None) else PROBLEMS_DIR
++    if not watch_dir.exists():
++        print(f"{RED}Error: {watch_dir} does not exist.{RESET}")
++        return 1
++
++    watcher = Watcher([watch_dir], interval=0.4)
++    watcher.poll()  # seed baseline
++
++    def run_check():
++        targets = sorted(
++            d for d in watch_dir.iterdir()
++            if d.is_dir() and (d / "problem.json").exists()
++        )
++        os.system("clear")
++        print(f"{BOLD}{CYAN}tutor watch — {watch_dir} (Ctrl-C to stop){RESET}\n")
++        errors, count = _validate_targets(targets, quiet_ok=True)
++        bad = []
++        for prob_dir in targets:
++            try:
++                meta = json.loads((prob_dir / "problem.json").read_text())
++            except Exception:
++                bad.append(prob_dir.name)
++                continue
++            from tutor.template import validate_meta
++            if validate_meta(meta):
++                bad.append(prob_dir.name)
++        if errors:
++            print(f"\n{RED}{errors} issue(s) in {len(bad)} problem(s): {', '.join(bad)}{RESET}")
++        else:
++            print(f"\n{GREEN}✓ All {count} problem(s) valid.{RESET}")
++
++    run_check()
++    print(f"\n{DIM}Watching for changes…{RESET}")
++    try:
++        while True:
++            changed = watcher.wait_for_change()
++            run_check()
++            names = ", ".join(sorted(Path(c).name for c in changed)[:5])
++            print(f"{DIM}↻ triggered by: {names}{RESET}")
++    except KeyboardInterrupt:
++        print(f"\n{YELLOW}Stopped watching.{RESET}")
++    return 0
+ 
+ 
+ def main(argv=None):
+@@ -669,20 +953,17 @@
+     p_pick = subparsers.add_parser("pick", help="Scaffold and open a problem solution in editor")
+     p_pick.add_argument("problem_id", help="Problem ID (e.g. 002, 2, or 002-hypervector-hamming)")
+     p_pick.add_argument("--lang", default=None, help="Implementation language (cpp, rust, python)")
+-    p_pick.add_argument("--no-edit", action="store_true", help="Do not open Synvim automatically")
++    p_pick.add_argument("--no-edit", action="store_true", help="Do not launch editor automatically")
+     p_pick.add_argument("--force", action="store_true", help="Bypass prerequisite lock check")
+     p_pick.set_defaults(func=cmd_pick)
+ 
+     # test
+     p_test = subparsers.add_parser("test", help="Execute locked test harness and compute Autolab scoreboard metrics")
++    p_test.add_argument("--remote", choices=("godbolt", "bridge"), default=None,
++                       help="Compile+run via Compiler Explorer (godbolt) or browser bridge")
+     p_test.add_argument("problem_id", nargs="?", default=None, help="Problem ID (optional if inside workspace)")
+     p_test.add_argument("--lang", default=None, help="Implementation language")
+     p_test.add_argument("--submission-dir", default=None, help="Explicit directory containing solution to grade")
+-    p_test.add_argument("--compile-timeout", type=_positive_seconds, default=25,
+-                        help="Compilation timeout in seconds (default: 25; increase for emulated guests)")
+-    p_test.add_argument("--remote", choices=("godbolt", "bridge"), default=None,
+-                        help="Compile and run on Compiler Explorer instead of local g++ "
+-                             "(bridge: via the hosting page, for the browser VM)")
+     p_test.set_defaults(func=cmd_test)
+ 
+     # submit
+@@ -698,6 +979,16 @@
+     p_board.add_argument("-p", "--problem", default=None, help="Show multi-metric scoreboard for a specific problem")
+     p_board.set_defaults(func=cmd_scoreboard)
+ 
++    # export-pages
++    p_exp = subparsers.add_parser("export-pages", help="Export catalog.json and leaderboard.json for GitHub Pages")
++    p_exp.set_defaults(func=cmd_export_pages)
++
++    # serve
++    p_srv = subparsers.add_parser("serve", aliases=["web", "studio"], help="Launch Neovim WASM Studio + Local C++20 Judge in browser")
++    p_srv.add_argument("-p", "--port", type=int, default=8080, help="HTTP port (default: 8080)")
++    p_srv.add_argument("--host", default="127.0.0.1", help="Host interface to bind to (default: 127.0.0.1 for local security)")
++    p_srv.set_defaults(func=cmd_serve)
++
+     # ci-grade-pr
+     p_cigrade = subparsers.add_parser("ci-grade-pr", help="CI Workflow 1: Verify PR isolation and grade submissions")
+     p_cigrade.add_argument("--user", required=True, help="GitHub actor username")
+@@ -753,6 +1044,41 @@
+     p_id.add_argument("--purge", action="store_true", help="Verified deletion: purge local sovereign identity and profile")
+     p_id.set_defaults(func=cmd_identity)
+ 
++    # new (issue #36: problem templates)
++    p_new = subparsers.add_parser(
++        "new", aliases=["create"],
++        help="Scaffold a new problem: `tutor new lockfree-stack` (id auto-numbered)",
++    )
++    p_new.add_argument("problem_id", nargs="?", default=None,
++                       help="Slug or full id, e.g. 'lockfree-stack' or '079-lockfree-stack'. "
++                            "Bare slugs get the next NNN prefix automatically. "
++                            "Omit entirely for an interactive wizard.")
++    p_new.add_argument("--title", required=False, default=None, help="Human-readable problem title")
++    p_new.add_argument("--slug", default=None, help="Alias for the positional slug (deprecated)")
++    p_new.add_argument("--difficulty", default="Medium", choices=["Easy", "Medium", "Hard"])
++    p_new.add_argument("--category", default="", help="Skill category (also used as track if --track omitted)")
++    p_new.add_argument("--track", default="", help="Curriculum track grouping")
++    p_new.add_argument("--tags", nargs="*", default=[], help="Free-form keyword tags")
++    p_new.add_argument("--depends-on", nargs="*", default=[], help="Prerequisite problem ids")
++    p_new.set_defaults(func=cmd_new)
++
++    # validate (issue #36: schema enforcement for existing problems)
++    p_val = subparsers.add_parser(
++        "validate",
++        help="Validate problem.json files against the canonical schema",
++    )
++    p_val.add_argument("problem_id", nargs="?", default=None,
++                       help="Validate a single problem (default: validate entire problems/ tree)")
++    p_val.set_defaults(func=cmd_validate)
++
++    # watch (author workflow: live re-validation on save)
++    p_watch = subparsers.add_parser(
++        "watch",
++        help="Live-validate problems/ on every file save (Ctrl-C to stop)",
++    )
++    p_watch.add_argument("--dir", default=None, help="Directory to watch (default: problems/)")
++    p_watch.set_defaults(func=cmd_watch)
++
+     args = parser.parse_args(argv)
+     if not args.command:
+         return cmd_list(args)
+diff --git a/tutor/db.py b/tutor/db.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/tutor/db.py
+@@ -0,0 +1,211 @@
++"""SQLite catalog index for the problem set (issue #39).
++
++The filesystem remains the source of truth: each ``problems/<id>/problem.json``
++is canonical. SQLite is used purely as a derived, rebuildable *index* so that
++catalog listing, filtering, and prerequisite lookups scale without scanning and
++parsing every JSON file on each invocation.
++
++Design notes:
++- Zero dependencies: uses the stdlib ``sqlite3`` module only.
++- The database lives under ``~/.local/share/tutor/catalog.db`` alongside the
++  existing progress/config state.
++- Staleness detection uses per-problem content hashes, so re-indexing only
++  reparses changed problems.
++- If the database is missing or corrupt it is simply rebuilt from disk; no
++  user data can be lost because nothing authoritative is stored here.
++"""
++
++import hashlib
++import json
++import sqlite3
++from pathlib import Path
++from typing import Any, Dict, List, Optional
++
++from tutor.state import STATE_DIR
++
++DB_PATH = STATE_DIR / "catalog.db"
++
++_SCHEMA = """
++CREATE TABLE IF NOT EXISTS problems (
++    id            TEXT PRIMARY KEY,
++    title         TEXT,
++    track         TEXT,
++    category      TEXT,
++    difficulty    TEXT,
++    dir           TEXT NOT NULL,
++    languages     TEXT NOT NULL DEFAULT '[]',
++    depends_on    TEXT NOT NULL DEFAULT '[]',
++    tags          TEXT NOT NULL DEFAULT '[]',
++    colspec       TEXT NOT NULL DEFAULT '[]',
++    spec          TEXT NOT NULL DEFAULT '',
++    content_hash  TEXT NOT NULL,
++    indexed_at    TEXT NOT NULL
++);
++
++CREATE TABLE IF NOT EXISTS dependencies (
++    problem_id  TEXT NOT NULL,
++    dep_id      TEXT NOT NULL,
++    PRIMARY KEY (problem_id, dep_id)
++) WITHOUT ROWID;
++
++CREATE INDEX IF NOT EXISTS idx_problems_difficulty ON problems(difficulty);
++CREATE INDEX IF NOT EXISTS idx_problems_category   ON problems(category);
++CREATE INDEX IF NOT EXISTS idx_deps_dep            ON dependencies(dep_id);
++"""
++
++
++def _hash_problem(meta_file: Path) -> str:
++    return hashlib.sha256(meta_file.read_bytes()).hexdigest()[:16]
++
++
++def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
++    path = Path(db_path) if db_path else DB_PATH
++    path.parent.mkdir(parents=True, exist_ok=True)
++    conn = sqlite3.connect(str(path), timeout=30.0)
++    conn.row_factory = sqlite3.Row
++    conn.execute("PRAGMA journal_mode=WAL")
++    conn.execute("PRAGMA synchronous=NORMAL")
++    conn.executescript(_SCHEMA)
++    return conn
++
++
++def _row_to_problem(row: sqlite3.Row) -> Dict[str, Any]:
++    p = dict(row)
++    for key in ("languages", "depends_on", "tags", "colspec"):
++        try:
++            p[key] = json.loads(p.get(key) or "[]")
++        except (TypeError, json.JSONDecodeError):
++            p[key] = []
++    return p
++
++
++class CatalogIndex:
++    """Incremental SQLite index over on-disk ``problem.json`` files."""
++
++    def __init__(self, db_path: Optional[Path] = None):
++        self._db_path = db_path
++        self._conn: Optional[sqlite3.Connection] = None
++
++    @property
++    def conn(self) -> sqlite3.Connection:
++        if self._conn is None:
++            self._conn = connect(self._db_path)
++        return self._conn
++
++    def close(self):
++        if self._conn is not None:
++            self._conn.close()
++            self._conn = None
++
++    def sync(self, search_paths: List[Path]) -> int:
++        """Reconcile the index with the given problem directories.
++
++        Returns the number of problems (re)inserted. Problems whose directory
++        disappeared are pruned. Never raises on individual bad problem.json
++        files — those are skipped, matching the previous scanner behavior.
++        """
++        from datetime import datetime, timezone
++
++        live_ids: Dict[str, Path] = {}  # id -> meta file
++        for base in search_paths:
++            base = Path(base)
++            if not base.exists():
++                continue
++            for prob_dir in sorted(base.iterdir()):
++                meta_file = prob_dir / "problem.json"
++                if not prob_dir.is_dir() or not meta_file.exists():
++                    continue
++                live_ids.setdefault(prob_dir.name, meta_file)
++
++        existing = {
++            r["id"]: r["content_hash"]
++            for r in self.conn.execute("SELECT id, content_hash FROM problems")
++        }
++
++        changed = 0
++        for pid, meta_file in live_ids.items():
++            try:
++                digest = _hash_problem(meta_file)
++            except OSError:
++                continue
++            if existing.get(pid) == digest:
++                continue
++            try:
++                meta = json.loads(meta_file.read_text())
++            except (OSError, json.JSONDecodeError):
++                continue
++            meta_id = meta.get("id", pid)
++            row = {
++                "id": meta_id,
++                "title": meta.get("title", meta_id),
++                "track": meta.get("track", meta.get("category", "Systems")),
++                "category": meta.get("category", ""),
++                "difficulty": meta.get("difficulty", ""),
++                "dir": str(meta_file.parent),
++                "languages": json.dumps(meta.get("languages", [])),
++                "depends_on": json.dumps(meta.get("depends_on", [])),
++                "tags": json.dumps(meta.get("tags", [])),
++                "colspec": json.dumps(meta.get("colspec", [])),
++                "spec": meta.get("spec", ""),
++                "content_hash": digest,
++                "indexed_at": datetime.now(timezone.utc).isoformat(),
++            }
++            self.conn.execute(
++                """
++                INSERT INTO problems (id, title, track, category, difficulty, dir,
++                                      languages, depends_on, tags, colspec, spec,
++                                      content_hash, indexed_at)
++                VALUES (:id, :title, :track, :category, :difficulty, :dir,
++                        :languages, :depends_on, :tags, :colspec, :spec,
++                        :content_hash, :indexed_at)
++                ON CONFLICT(id) DO UPDATE SET
++                    title=excluded.title, track=excluded.track,
++                    category=excluded.category, difficulty=excluded.difficulty,
++                    dir=excluded.dir, languages=excluded.languages,
++                    depends_on=excluded.depends_on, tags=excluded.tags,
++                    colspec=excluded.colspec, spec=excluded.spec,
++                    content_hash=excluded.content_hash,
++                    indexed_at=excluded.indexed_at
++                """,
++                row,
++            )
++            self.conn.execute("DELETE FROM dependencies WHERE problem_id = ?", (meta_id,))
++            for dep in meta.get("depends_on", []):
++                self.conn.execute(
++                    "INSERT OR IGNORE INTO dependencies (problem_id, dep_id) VALUES (?, ?)",
++                    (meta_id, dep),
++                )
++            changed += 1
++
++        stale = [pid for pid in existing if pid not in live_ids]
++        for pid in stale:
++            self.conn.execute("DELETE FROM problems WHERE id = ?", (pid,))
++            self.conn.execute("DELETE FROM dependencies WHERE problem_id = ?", (pid,))
++            changed += 1
++
++        self.conn.commit()
++        return changed
++
++    def all_problems(self) -> List[Dict[str, Any]]:
++        rows = self.conn.execute("SELECT * FROM problems ORDER BY id").fetchall()
++        return [_row_to_problem(r) for r in rows]
++
++    def get(self, problem_id: str) -> Optional[Dict[str, Any]]:
++        row = self.conn.execute(
++            "SELECT * FROM problems WHERE id = ?", (problem_id,)
++        ).fetchone()
++        return _row_to_problem(row) if row else None
++
++    def dependents_of(self, problem_id: str) -> List[str]:
++        rows = self.conn.execute(
++            "SELECT problem_id FROM dependencies WHERE dep_id = ?", (problem_id,)
++        ).fetchall()
++        return [r["problem_id"] for r in rows]
++
++    def counts_by(self, column: str) -> Dict[str, int]:
++        if column not in ("difficulty", "category", "track"):
++            raise ValueError(f"unsupported grouping column: {column}")
++        rows = self.conn.execute(
++            f"SELECT {column} AS k, COUNT(*) AS n FROM problems GROUP BY {column}"
++        ).fetchall()
++        return {r["k"]: r["n"] for r in rows}
+diff --git a/tutor/template.py b/tutor/template.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/tutor/template.py
+@@ -0,0 +1,302 @@
++"""Problem template scaffolding (issue #36).
++
++Defines the canonical ``problem.json`` schema and generates new problem
++directories from it, so contributors don't hand-craft metadata and drift.
++
++Schema fields (all problems in the repo currently carry these ten keys):
++
++    id          directory name / unique identifier, e.g. "079-new-problem"
++    title       human-readable one-liner
++    track       coarse curriculum grouping shown in `tutor list`
++    category    skill category used for grouping & recommendations
++    difficulty  one of EASY | MEDIUM | HARD
++    depends_on  list of prerequisite problem ids (DAG edges)
++    tags        free-form keyword list
++    colspec     leaderboard column spec: [{"hdr": str, "asc": bool}, ...]
++    languages   supported language dirs, e.g. ["cpp"]
++    spec        markdown problem statement shown to the student
++"""
++
++import json
++import re
++from pathlib import Path
++from typing import Any, Dict, List, Optional
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++PROBLEMS_DIR = REPO_ROOT / "problems"
++
++DIFFICULTIES = ("Easy", "Medium", "Hard")
++
++DEFAULT_COLSPEC = [
++    {"hdr": "Score", "asc": False},
++    {"hdr": "Cycles/Op", "asc": True},
++    {"hdr": "Bytes", "asc": True},
++]
++
++_ID_RE = re.compile(r"^[0-9]{3}[a-z]?-[a-z0-9]+(?:-[a-z0-9]+)*$")
++
++_CPP_STUB_NAME = "solution_stub.hpp"
++
++# Students always work in `solution.hpp` (the workspace copies the stub to
++# that name), so harnesses include it directly. The scaffold ships a minimal
++# solution.hpp too, so a freshly created problem compiles and passes out of
++# the box — authors iterate from green, not from a broken build.
++_CPP_SOLUTION_NAME = "solution.hpp"
++_CPP_SOLUTION_TEMPLATE = """#pragma once
++// {problem_id}: {title}
++// Reference/skeleton implementation students receive as their starting point.
++
++#include <cstdint>
++#include <string>
++#include <vector>
++"""
++
++# Makefile shipped with every scaffolded cpp problem. Matches the layout the
++# test runner expects (compiles solution.hpp against the locked harness.cpp).
++_CPP_MAKEFILE = """CXX ?= g++
++CXXFLAGS ?= -O3 -std=c++20 -Wall -Wextra -pthread -I.
++
++.PHONY: test clean
++
++test: harness_bin
++\t./harness_bin
++
++harness_bin: harness.cpp solution.hpp
++\t$(CXX) $(CXXFLAGS) harness.cpp -o harness_bin
++
++clean:
++\trm -f harness_bin
++"""
++
++
++def next_problem_id(problems_dir: Path = PROBLEMS_DIR) -> str:
++    """Suggest the next numeric problem id prefix (e.g. '079')."""
++    highest = -1
++    if problems_dir.exists():
++        for d in problems_dir.iterdir():
++            m = re.match(r"^(\d{3})", d.name)
++            if m:
++                highest = max(highest, int(m.group(1)))
++    return f"{highest + 1:03d}"
++
++
++def normalize_problem_id(problem_id: str, problems_dir: Path = PROBLEMS_DIR) -> str:
++    """Accept a bare kebab-case slug and auto-prefix the next number.
++
++    ``lockfree-stack`` -> ``079-lockfree-stack``. Ids that already start with
++    three digits are returned unchanged (after trimming whitespace).
++    """
++    pid = problem_id.strip().lower()
++    if re.match(r"^\d{3}", pid):
++        return pid
++    slug = re.sub(r"[^a-z0-9]+", "-", pid).strip("-")
++    if not slug:
++        raise ValueError(f"cannot derive a problem slug from {problem_id!r}")
++    return f"{next_problem_id(problems_dir)}-{slug}"
++
++
++def validate_meta(meta: Dict[str, Any]) -> List[str]:
++    """Return a list of human-readable schema errors (empty == valid)."""
++    errors: List[str] = []
++    required = ["id", "title", "track", "category", "difficulty",
++                "depends_on", "tags", "colspec", "languages", "spec"]
++    for key in required:
++        if key not in meta:
++            errors.append(f"missing required field: {key!r}")
++
++    pid = meta.get("id", "")
++    if pid and not _ID_RE.match(pid):
++        errors.append(
++            f"id {pid!r} must match NNN[-suffix] (3 digits, optional letter, "
++            "then kebab-case words), e.g. '079-lockfree-stack'"
++        )
++
++    diff = meta.get("difficulty")
++    if diff is not None:
++        # Accept any case; canonicalize later
++        if str(diff).title() not in DIFFICULTIES:
++            errors.append(f"difficulty {diff!r} must be one of {list(DIFFICULTIES)}")
++
++    deps = meta.get("depends_on")
++    if deps is not None and (not isinstance(deps, list) or any(not isinstance(x, str) for x in deps)):
++        errors.append("depends_on must be a list of problem id strings")
++
++    langs = meta.get("languages")
++    if langs is not None and (not isinstance(langs, list) or not langs):
++        errors.append("languages must be a non-empty list, e.g. ['cpp']")
++
++    colspec = meta.get("colspec")
++    if colspec is not None:
++        if not isinstance(colspec, list) or not all(
++            isinstance(c, dict) and "hdr" in c and "asc" in c for c in colspec
++        ):
++            errors.append('colspec entries must be objects like {"hdr": "Score", "asc": false}')
++
++    if not meta.get("spec", "").strip():
++        errors.append("spec (markdown problem statement) must not be empty")
++
++    return errors
++
++
++def build_meta(
++    problem_id: str,
++    title: str,
++    difficulty: str = "Medium",
++    category: str = "",
++    track: str = "",
++    tags: Optional[List[str]] = None,
++    depends_on: Optional[List[str]] = None,
++    languages: Optional[List[str]] = None,
++    spec: str = "",
++) -> Dict[str, Any]:
++    """Assemble a defaults-filled problem metadata dict."""
++    category = category or "Systems"
++    difficulty = str(difficulty).title() if difficulty else "Medium"
++    if difficulty not in DIFFICULTIES:
++        difficulty = "Medium"
++    return {
++        "id": problem_id,
++        "title": title,
++        "track": track or category,
++        "category": category,
++        "difficulty": difficulty,
++        "depends_on": depends_on or [],
++        "tags": tags or [],
++        "colspec": DEFAULT_COLSPEC,
++        "languages": languages or ["cpp"],
++        "spec": spec or _default_spec(problem_id, title),
++    }
++
++
++def _default_spec(problem_id: str, title: str) -> str:
++    return (
++        f"# {problem_id}: {title}\n\n"
++        "## Problem Statement\n\n"
++        "<!-- Describe the problem the student must solve. -->\n\n"
++        "## Requirements\n\n"
++        "1. TODO: state the exact function signatures and behavior.\n\n"
++        "## Constraints\n\n"
++        "- TODO: complexity / correctness constraints judged by the harness.\n"
++    )
++
++
++_CPP_STUB_TEMPLATE = """#pragma once
++// {problem_id}: {title}
++// Student solution goes here. Do not modify the harness.
++
++#include <cstdint>
++#include <string>
++#include <vector>
++"""
++
++_CPP_HARNESS_TEMPLATE = """// LOCKED — do not modify. Judges {problem_id}.
++#include "solution.hpp"
++
++#include <cassert>
++#include <cstdio>
++#include <cstdlib>
++#include <iostream>
++
++int main() {{
++    std::cout << "=== Running {problem_id} Test Suite ===\\n";
++
++    // TODO: add assertions against the required API, e.g.:
++    // assert(solution_fn(input) == expected);
++
++    std::cout << "ALL TESTS PASSED" << std::endl;
++    return EXIT_SUCCESS;
++}}
++"""
++
++
++def scaffold_problem(
++    problem_id: str,
++    title: str,
++    problems_dir: Path = PROBLEMS_DIR,
++    **meta_kwargs,
++) -> Path:
++    """Create ``problems/<id>/problem.json`` plus C++ stub/harness skeletons.
++
++    Raises ``FileExistsError`` if the problem already exists and ``ValueError``
++    with the full error list if the generated metadata fails validation.
++    """
++    meta = build_meta(problem_id, title, **meta_kwargs)
++    errors = validate_meta(meta)
++    if errors:
++        raise ValueError("invalid problem metadata:\n  - " + "\n  - ".join(errors))
++
++    prob_dir = problems_dir / problem_id
++    if prob_dir.exists():
++        raise FileExistsError(f"{prob_dir} already exists")
++
++    lang_dirs = meta["languages"]
++    if "cpp" in lang_dirs:
++        cpp_dir = prob_dir / "cpp"
++        cpp_dir.mkdir(parents=True)
++        (cpp_dir / _CPP_STUB_NAME).write_text(
++            _CPP_STUB_TEMPLATE.format(problem_id=problem_id, title=title)
++        )
++        (cpp_dir / _CPP_SOLUTION_NAME).write_text(
++            _CPP_SOLUTION_TEMPLATE.format(problem_id=problem_id, title=title)
++        )
++        (cpp_dir / "harness.cpp").write_text(
++            _CPP_HARNESS_TEMPLATE.format(problem_id=problem_id)
++        )
++        (cpp_dir / "Makefile").write_text(_CPP_MAKEFILE)
++    else:
++        prob_dir.mkdir(parents=True)
++
++    (prob_dir / "problem.json").write_text(json.dumps(meta, indent=2) + "\n")
++    return prob_dir
++
++
++class Watcher:
++    """Lightweight mtime poller that fires a callback when files change.
++
++    Used by ``tutor watch`` to revalidate the catalog on save, so authors get
++    instant feedback without re-running ``tutor validate`` by hand. Uses only
++    the stdlib (os.stat polling) to keep the zero-dependency promise.
++    """
++
++    def __init__(self, paths, interval: float = 0.5):
++        self._paths = [Path(p) for p in paths]
++        self._interval = interval
++        self._stamps = {}
++
++    def _snapshot(self) -> dict:
++        stamps = {}
++        for base in self._paths:
++            if not base.exists():
++                continue
++            if base.is_file():
++                try:
++                    stamps[str(base)] = base.stat().st_mtime_ns
++                except OSError:
++                    pass
++                continue
++            for f in base.rglob("*"):
++                if f.is_file() and "__pycache__" not in f.parts:
++                    try:
++                        stamps[str(f)] = f.stat().st_mtime_ns
++                    except OSError:
++                        pass
++        return stamps
++
++    def poll(self):
++        """Return the set of changed/added/removed paths since last poll."""
++        now = self._snapshot()
++        changed = {
++            p for p, t in now.items() if self._stamps.get(p) != t
++        } | {p for p in self._stamps if p not in now}
++        self._stamps = now
++        return changed
++
++    def wait_for_change(self):
++        """Block until at least one tracked path changes; return those paths."""
++        import time
++
++        while True:
++            changed = self.poll()
++            if changed:
++                return changed
++            time.sleep(self._interval)
+diff --git a/tutor/workspace.py b/tutor/workspace.py
+--- a/tutor/workspace.py
++++ b/tutor/workspace.py
+@@ -34,10 +34,10 @@
+         # 1. Write Problem Specification
+         spec_text = problem.get("spec")
+         readme_src = prob_src_dir / "README.md"
+-        readme_dst = target_dir / "spec.txt"
+         if spec_text:
+-            readme_dst.write_text(spec_text, encoding="utf-8")
++            (target_dir / "spec.txt").write_text(spec_text, encoding="utf-8")
+         elif readme_src.exists():
++            readme_dst = target_dir / "spec.txt"
+             shutil.copy2(readme_src, readme_dst)
+ 
+         # 2. Check language implementation folder

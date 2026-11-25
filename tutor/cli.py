@@ -14,6 +14,7 @@ from tutor.ledger import digest_files
 from tutor.runner import TestRunner
 from tutor.scoreboard import (
     LEADERBOARD_FILE,
+    export_static_site_data,
     load_leaderboard,
     merge_scoreboard_entries,
     verify_pr_isolation,
@@ -34,6 +35,18 @@ RESET = "\033[0m"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LGCC_BIN = REPO_ROOT / "bin" / "lgcc"
+
+
+
+def resolve_editor():
+    """Prefer $VISUAL / $EDITOR, then tutor config, then plain vim."""
+    return (
+        os.environ.get("VISUAL")
+        or os.environ.get("EDITOR")
+        or os.environ.get("TUTOR_EDITOR")
+        or get_config().get("editor")
+        or "vim"
+    )
 
 
 def cmd_list(args):
@@ -131,16 +144,6 @@ def cmd_dag(args):
     return 0
 
 
-def synvim_installed():
-    config_home = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-    return (config_home / "nvim" / "lua" / "synvim").is_dir()
-
-
-def resolve_editor():
-    """Synvim (nvim) by default; deliberately ignores $EDITOR so problems open in one controlled editor."""
-    return os.environ.get("TUTOR_EDITOR") or get_config().get("editor") or "nvim"
-
-
 def cmd_pick(args):
     catalog = ProblemCatalog()
     problem = catalog.get_problem(args.problem_id)
@@ -171,8 +174,6 @@ def cmd_pick(args):
 
     if not args.no_edit:
         editor = resolve_editor()
-        if editor == "nvim" and not synvim_installed():
-            print(f"{YELLOW}⚠ Synvim is not installed; opening plain nvim. Install it with synvim/setup.sh.{RESET}")
         print(f"{DIM}Opening {editor} {solution_path}...{RESET}\n")
         subprocess.call([*shlex.split(editor), str(solution_path)])
 
@@ -215,7 +216,7 @@ def cmd_test(args):
     print(f"\n⚡ Running locked test harness for {BOLD}{problem.get('title', problem['id'])}{RESET} [{lang}]...")
     runner = TestRunner()
     success, log, runtime_ms, metrics = runner.run_test(
-        problem, lang=lang, submission_dir=sub_dir, compile_timeout=args.compile_timeout,
+        problem, lang=lang, submission_dir=sub_dir, compile_timeout=getattr(args, "compile_timeout", 25),
         remote=getattr(args, "remote", None),
     )
 
@@ -440,11 +441,6 @@ def cmd_ci_grade_pr(args):
                     "scoreboard": metrics["scoreboard"],
                     "submitted_at": datetime.now(timezone.utc).isoformat(),
                     "commit_sha": args.commit_sha or "pr",
-                    "problem_hash": problem_digest(prob),
-                    "solution_sha256": digest_files(
-                        p for p in Path(sub_dir).iterdir() if p.name.startswith("solution")
-                    ),
-                    "verifier": "ci",
                 }
             )
 
@@ -506,7 +502,121 @@ def cmd_ci_merge_scoreboard(args):
         return 0
 
     board = merge_scoreboard_entries(entries)
+    export_static_site_data()
     print(f"{GREEN}✓ Merged {len(entries)} entry/entries into {LEADERBOARD_FILE}. Global ranked users: {len(board.get('global_rankings', []))}{RESET}")
+    return 0
+
+
+def cmd_export_pages(args):
+    cat_path, board_path = export_static_site_data()
+    print(f"{GREEN}✓ Exported GitHub Pages data:{RESET}")
+    print(f"  • Catalog     : {CYAN}{cat_path}{RESET}")
+    print(f"  • Leaderboard : {CYAN}{board_path}{RESET}")
+    return 0
+
+
+def cmd_serve(args):
+    """
+    Serves the Neovim WASM Studio + Skill-Tree DAG + Autolab Scoreboard (`docs/`) locally
+    and exposes `/api/judge` for sub-100ms local `g++ -O3 -std=c++20` execution.
+    """
+    import http.server
+    import tempfile
+
+    export_static_site_data()
+    docs_dir = REPO_ROOT / "docs"
+    port = int(getattr(args, "port", 8080))
+
+    class TutorStudioHandler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *h_args, **h_kwargs):
+            super().__init__(*h_args, directory=str(docs_dir), **h_kwargs)
+
+        def do_POST(self):
+            if self.path == "/api/judge":
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length).decode("utf-8")
+                try:
+                    req = json.loads(raw)
+                    prob_id = req.get("problem_id", "")
+                    code = req.get("code", "")
+                    user = req.get("user") or os.environ.get("USER", "local-user")
+                    catalog = ProblemCatalog()
+                    prob = catalog.get_problem(prob_id)
+                    if not prob:
+                        self._send_json(404, {"ok": False, "log": f"Problem '{prob_id}' not found."})
+                        return
+
+                    lang = req.get("lang")
+                    if not lang:
+                        lang = "sh" if "sh" in prob.get("languages", []) else "cpp"
+                    sol_filename = "solution.sh" if lang == "sh" else "solution.hpp"
+
+                    with tempfile.TemporaryDirectory(prefix="tutor_web_") as tmp_dir:
+                        sol_path = Path(tmp_dir) / sol_filename
+                        sol_path.write_text(code, encoding="utf-8")
+                        if lang == "sh":
+                            sol_path.chmod(0o755)
+                        runner = TestRunner()
+                        success, log, runtime_ms, metrics = runner.run_test(
+                            prob, lang=lang, submission_dir=Path(tmp_dir)
+                        )
+                        is_submission = bool(req.get("is_submission", False))
+                        if success and is_submission:
+                            from tutor.state import mark_solved
+                            mark_solved(
+                                prob["id"],
+                                lang,
+                                runtime_ms=runtime_ms,
+                                cycles_per_op=metrics.get("cycles_per_op", 0.0),
+                                code_bytes=metrics.get("code_bytes", 0),
+                            )
+                            if req.get("update_board", True):
+                                merge_scoreboard_entries(
+                                    [
+                                        {
+                                            "user": user,
+                                            "problem_id": prob["id"],
+                                            "lang": lang,
+                                            "score": metrics["score"],
+                                            "scoreboard": metrics["scoreboard"],
+                                            "submitted_at": datetime.now(timezone.utc).isoformat(),
+                                        }
+                                    ]
+                                )
+                        self._send_json(
+                            200,
+                            {
+                                "ok": success,
+                                "is_submission": is_submission,
+                                "log": log,
+                                "runtime_ms": round(runtime_ms, 2),
+                                "metrics": metrics,
+                                "engine": "local-g++",
+                            },
+                        )
+                except Exception as exc:
+                    self._send_json(500, {"ok": False, "log": f"Server error: {exc}"})
+            else:
+                self.send_error(404)
+
+        def _send_json(self, status_code: int, payload: dict):
+            data = json.dumps(payload).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    host = getattr(args, "host", "127.0.0.1")
+    print(f"\n{BOLD}{CYAN}=== SYNTRA TUTOR — NEOVIM WASM STUDIO & LOCAL JUDGE ==={RESET}")
+    print(f"  • Studio URL : {GREEN}{BOLD}http://{host}:{port}{RESET}")
+    print(f"  • Editor     : Genuine Neovim WebAssembly (:w, :Run, <Space>r, <F5>)")
+    print(f"  • Judge      : Local g++ -O3 -std=c++20 (/api/judge) + Cloud Godbolt Fallback\n")
+    with http.server.ThreadingHTTPServer((host, port), TutorStudioHandler) as httpd:
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nShutting down studio server.")
     return 0
 
 
@@ -640,11 +750,185 @@ def cmd_identity(args):
     return 0
 
 
-def _positive_seconds(value):
-    seconds = int(value)
-    if seconds <= 0:
-        raise argparse.ArgumentTypeError("timeout must be a positive number of seconds")
-    return seconds
+def _validate_targets(targets, quiet_ok: bool = False):
+    """Shared validation core for `tutor validate` and `tutor watch`.
+
+    Returns (total_errors, checked_count).
+    """
+    from tutor.template import validate_meta
+
+    known_ids = {p["id"] for p in ProblemCatalog().list_problems()}
+    total_errors = 0
+    for prob_dir in targets:
+        meta_file = prob_dir / "problem.json"
+        try:
+            meta = json.loads(meta_file.read_text())
+        except Exception as e:
+            print(f"{RED}✗ {prob_dir.name}: unreadable problem.json ({e}){RESET}")
+            total_errors += 1
+            continue
+        errors = validate_meta(meta)
+        # Cross-check: depends_on must reference existing problems
+        for dep in meta.get("depends_on", []):
+            if dep not in known_ids:
+                errors.append(f"depends_on references unknown problem id {dep!r}")
+        if errors:
+            total_errors += len(errors)
+            print(f"{RED}✗ {prob_dir.name}:{RESET}")
+            for err in errors:
+                print(f"    - {err}")
+        elif not quiet_ok:
+            print(f"{GREEN}✓ {prob_dir.name}{RESET}")
+    return total_errors, len(targets)
+
+
+def cmd_new(args):
+    """Scaffold a new problem from the canonical template (issue #36)."""
+    from tutor.template import (
+        PROBLEMS_DIR,
+        normalize_problem_id,
+        scaffold_problem,
+    )
+
+    raw = args.problem_id or args.slug
+    if not raw:
+        print(f"{YELLOW}No problem name given — starting interactive wizard.{RESET}")
+        raw = input("  slug or id (e.g. lockfree-stack): ").strip()
+        if not raw:
+            print(f"{RED}Error: a slug or problem id is required.{RESET}")
+            return 1
+        title = input("  title (blank = derived from slug): ").strip() or None
+        diff_in = input("  difficulty [Easy/Medium/Hard] (default Medium): ").strip()
+        difficulty = diff_in.title() if diff_in else "Medium"
+        if difficulty not in ("Easy", "Medium", "Hard"):
+            print(f"{RED}Error: invalid difficulty {diff_in!r}.{RESET}")
+            return 1
+        category = input("  category (blank = Systems): ").strip()
+        tags_in = input("  tags (space-separated, optional): ").strip()
+        deps_in = input("  depends-on ids (space-separated, optional): ").strip()
+        args = argparse.Namespace(**{**vars(args), "difficulty": difficulty,
+                                     "category": category,
+                                     "tags": tags_in.split() if tags_in else [],
+                                     "depends_on": deps_in.split() if deps_in else []})
+    else:
+        title = args.title
+
+    try:
+        problem_id = normalize_problem_id(raw)
+    except ValueError as e:
+        print(f"{RED}Error: {e}{RESET}")
+        return 1
+
+    title = title or problem_id.split("-", 1)[-1].replace("-", " ").title()
+
+    try:
+        prob_dir = scaffold_problem(
+            problem_id,
+            title,
+            difficulty=args.difficulty,
+            category=args.category,
+            track=args.track,
+            tags=args.tags,
+            depends_on=args.depends_on,
+        )
+    except (ValueError, FileExistsError) as e:
+        print(f"{RED}Error: {e}{RESET}")
+        return 1
+
+    # Validate immediately so authors never start from a broken scaffold,
+    # and force the SQLite index to pick up the new problem right away.
+    errors, _ = _validate_targets([prob_dir], quiet_ok=True)
+
+    print(f"\n{GREEN}✓ Created {BOLD}{problem_id}{RESET}  ({args.difficulty}, {errors} schema issue(s))")
+    print(f"  • {prob_dir.relative_to(REPO_ROOT)}/")
+    print(f"      problem.json           ← metadata + spec (edit me)")
+    print(f"      cpp/solution_stub.hpp  ← API skeleton students receive")
+    print(f"      cpp/solution.hpp       ← compiles green out of the box")
+    print(f"      cpp/harness.cpp        ← locked judge — add assertions")
+    print(f"      cpp/Makefile           ← make test compiles & runs the harness")
+    if errors:
+        print(f"\n{RED}Fix these before committing:{RESET}")
+        for err in errors:
+            print(f"    - {err}")
+        return 1
+    print(f"\n  Next: write the spec in problem.json, add harness assertions, then:")
+    print(f"        {DIM}make -C {prob_dir.relative_to(REPO_ROOT)}/cpp test   # compile+run harness{RESET}")
+    print(f"        {DIM}tutor validate {problem_id}                    # schema + DAG check{RESET}")
+    print(f"        {DIM}tutor watch                                # live re-validate on save{RESET}")
+    return 0
+
+
+def cmd_validate(args):
+    """Validate problem.json files against the canonical schema (issue #36)."""
+    from tutor.template import PROBLEMS_DIR
+
+    if args.problem_id:
+        catalog = ProblemCatalog()
+        problem = catalog.get_problem(args.problem_id)
+        if not problem:
+            print(f"{RED}Error: Problem '{args.problem_id}' not found.{RESET}")
+            return 1
+        targets = [Path(problem["dir"])]
+    else:
+        targets = sorted(
+            d for d in PROBLEMS_DIR.iterdir()
+            if d.is_dir() and (d / "problem.json").exists()
+        )
+
+    total_errors, count = _validate_targets(targets)
+    if total_errors:
+        print(f"\n{RED}{total_errors} validation error(s) across {count} problem(s).{RESET}")
+        return 1
+    print(f"\n{GREEN}All {count} problem(s) valid.{RESET}")
+    return 0
+
+
+def cmd_watch(args):
+    """Live-validate the problems tree on file changes (author workflow)."""
+    from tutor.template import PROBLEMS_DIR, Watcher
+
+    watch_dir = Path(args.dir).resolve() if getattr(args, "dir", None) else PROBLEMS_DIR
+    if not watch_dir.exists():
+        print(f"{RED}Error: {watch_dir} does not exist.{RESET}")
+        return 1
+
+    watcher = Watcher([watch_dir], interval=0.4)
+    watcher.poll()  # seed baseline
+
+    def run_check():
+        targets = sorted(
+            d for d in watch_dir.iterdir()
+            if d.is_dir() and (d / "problem.json").exists()
+        )
+        os.system("clear")
+        print(f"{BOLD}{CYAN}tutor watch — {watch_dir} (Ctrl-C to stop){RESET}\n")
+        errors, count = _validate_targets(targets, quiet_ok=True)
+        bad = []
+        for prob_dir in targets:
+            try:
+                meta = json.loads((prob_dir / "problem.json").read_text())
+            except Exception:
+                bad.append(prob_dir.name)
+                continue
+            from tutor.template import validate_meta
+            if validate_meta(meta):
+                bad.append(prob_dir.name)
+        if errors:
+            print(f"\n{RED}{errors} issue(s) in {len(bad)} problem(s): {', '.join(bad)}{RESET}")
+        else:
+            print(f"\n{GREEN}✓ All {count} problem(s) valid.{RESET}")
+
+    run_check()
+    print(f"\n{DIM}Watching for changes…{RESET}")
+    try:
+        while True:
+            changed = watcher.wait_for_change()
+            run_check()
+            names = ", ".join(sorted(Path(c).name for c in changed)[:5])
+            print(f"{DIM}↻ triggered by: {names}{RESET}")
+    except KeyboardInterrupt:
+        print(f"\n{YELLOW}Stopped watching.{RESET}")
+    return 0
 
 
 def main(argv=None):
@@ -669,20 +953,17 @@ def main(argv=None):
     p_pick = subparsers.add_parser("pick", help="Scaffold and open a problem solution in editor")
     p_pick.add_argument("problem_id", help="Problem ID (e.g. 002, 2, or 002-hypervector-hamming)")
     p_pick.add_argument("--lang", default=None, help="Implementation language (cpp, rust, python)")
-    p_pick.add_argument("--no-edit", action="store_true", help="Do not open Synvim automatically")
+    p_pick.add_argument("--no-edit", action="store_true", help="Do not launch editor automatically")
     p_pick.add_argument("--force", action="store_true", help="Bypass prerequisite lock check")
     p_pick.set_defaults(func=cmd_pick)
 
     # test
     p_test = subparsers.add_parser("test", help="Execute locked test harness and compute Autolab scoreboard metrics")
+    p_test.add_argument("--remote", choices=("godbolt", "bridge"), default=None,
+                       help="Compile+run via Compiler Explorer (godbolt) or browser bridge")
     p_test.add_argument("problem_id", nargs="?", default=None, help="Problem ID (optional if inside workspace)")
     p_test.add_argument("--lang", default=None, help="Implementation language")
     p_test.add_argument("--submission-dir", default=None, help="Explicit directory containing solution to grade")
-    p_test.add_argument("--compile-timeout", type=_positive_seconds, default=25,
-                        help="Compilation timeout in seconds (default: 25; increase for emulated guests)")
-    p_test.add_argument("--remote", choices=("godbolt", "bridge"), default=None,
-                        help="Compile and run on Compiler Explorer instead of local g++ "
-                             "(bridge: via the hosting page, for the browser VM)")
     p_test.set_defaults(func=cmd_test)
 
     # submit
@@ -697,6 +978,16 @@ def main(argv=None):
     p_board = subparsers.add_parser("scoreboard", aliases=["board"], help="Display Autolab Scoreboard rankings")
     p_board.add_argument("-p", "--problem", default=None, help="Show multi-metric scoreboard for a specific problem")
     p_board.set_defaults(func=cmd_scoreboard)
+
+    # export-pages
+    p_exp = subparsers.add_parser("export-pages", help="Export catalog.json and leaderboard.json for GitHub Pages")
+    p_exp.set_defaults(func=cmd_export_pages)
+
+    # serve
+    p_srv = subparsers.add_parser("serve", aliases=["web", "studio"], help="Launch Neovim WASM Studio + Local C++20 Judge in browser")
+    p_srv.add_argument("-p", "--port", type=int, default=8080, help="HTTP port (default: 8080)")
+    p_srv.add_argument("--host", default="127.0.0.1", help="Host interface to bind to (default: 127.0.0.1 for local security)")
+    p_srv.set_defaults(func=cmd_serve)
 
     # ci-grade-pr
     p_cigrade = subparsers.add_parser("ci-grade-pr", help="CI Workflow 1: Verify PR isolation and grade submissions")
@@ -752,6 +1043,41 @@ def main(argv=None):
     p_id.add_argument("--import-file", default=None, help="Import profile JSON backup from file path")
     p_id.add_argument("--purge", action="store_true", help="Verified deletion: purge local sovereign identity and profile")
     p_id.set_defaults(func=cmd_identity)
+
+    # new (issue #36: problem templates)
+    p_new = subparsers.add_parser(
+        "new", aliases=["create"],
+        help="Scaffold a new problem: `tutor new lockfree-stack` (id auto-numbered)",
+    )
+    p_new.add_argument("problem_id", nargs="?", default=None,
+                       help="Slug or full id, e.g. 'lockfree-stack' or '079-lockfree-stack'. "
+                            "Bare slugs get the next NNN prefix automatically. "
+                            "Omit entirely for an interactive wizard.")
+    p_new.add_argument("--title", required=False, default=None, help="Human-readable problem title")
+    p_new.add_argument("--slug", default=None, help="Alias for the positional slug (deprecated)")
+    p_new.add_argument("--difficulty", default="Medium", choices=["Easy", "Medium", "Hard"])
+    p_new.add_argument("--category", default="", help="Skill category (also used as track if --track omitted)")
+    p_new.add_argument("--track", default="", help="Curriculum track grouping")
+    p_new.add_argument("--tags", nargs="*", default=[], help="Free-form keyword tags")
+    p_new.add_argument("--depends-on", nargs="*", default=[], help="Prerequisite problem ids")
+    p_new.set_defaults(func=cmd_new)
+
+    # validate (issue #36: schema enforcement for existing problems)
+    p_val = subparsers.add_parser(
+        "validate",
+        help="Validate problem.json files against the canonical schema",
+    )
+    p_val.add_argument("problem_id", nargs="?", default=None,
+                       help="Validate a single problem (default: validate entire problems/ tree)")
+    p_val.set_defaults(func=cmd_validate)
+
+    # watch (author workflow: live re-validation on save)
+    p_watch = subparsers.add_parser(
+        "watch",
+        help="Live-validate problems/ on every file save (Ctrl-C to stop)",
+    )
+    p_watch.add_argument("--dir", default=None, help="Directory to watch (default: problems/)")
+    p_watch.set_defaults(func=cmd_watch)
 
     args = parser.parse_args(argv)
     if not args.command:
