@@ -12,3 +12,4 @@ dependencies = []
 
 [project.scripts]
 tutor = "tutor.cli:main"
+tutor-learning = "tutor.learning_cli:main"
