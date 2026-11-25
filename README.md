@@ -1,28 +1,48 @@
-```
-2026/11/19
-Browser app has been phased out.
-Use the CLI in conjunction with Synvim.
+# Syntra Tutor
 
-But a different browser implementation is being worked on.
-First I tired bundling everything inside a browser vm,
-but g++ compilation times in the vm were horrendously slow.
+Pure CLI problem runner and Socratic systems-programming tutor.
 
-Solution? Compile clang to wasm.
-Vim was already being compiled to wasm for the browser app.
-Adding gdb and rr too.
+Browser / WebAssembly / Neovim-plugin surfaces have been removed.
+Edit and read solutions with plain vim (or `$VISUAL` / `$EDITOR`).
 
-Oh yeah I tried ttyd too but you know how that goes.
-Needs to be set up outside the browser first; needless friction.
-```
+## Quick start
 
+```bash
+# install (editable) + symlink CLI
+make install
+# or: pip install -e . && ln -sf "$PWD/bin/tutor" ~/.local/bin/tutor
 
-
-```
-Yeah, so, the realization is, just fucking code. 
-Write tests, and code.
-Write theorems, then prove them.
-Write declarative specifications, and check them.
-And make sure you bundle both together.
+tutor list
+tutor pick 002-hypervector-hamming   # scaffolds workspace and opens vim
+tutor test 002-hypervector-hamming
 ```
 
+## Editor
 
+`tutor pick` opens the solution file with:
+
+1. `$VISUAL` or `$EDITOR` if set  
+2. `TUTOR_EDITOR` if set  
+3. config key `editor`  
+4. otherwise **`vim`**
+
+Reading problem specs is the same path: the scaffolded workspace README and
+solution are ordinary files; open them in vim.
+
+## Remote compile (optional)
+
+`tutor test --remote godbolt` still talks to Compiler Explorer over HTTPS
+when a local compiler is unavailable. The old in-browser OSC "bridge" mode
+is gone.
+
+## Layout (CLI core)
+
+```
+tutor/          Python package (cli, runner, catalog, workspace, …)
+bin/tutor       launcher
+problems/       locked problem definitions + harnesses
+policy/         architecture-as-code (OPA Rego)
+tests/          unit tests
+```
+
+Write tests. Write theorems. Prove them. Bundle both.

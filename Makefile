@@ -14,9 +14,8 @@ test:
 install: build
 	mkdir -p $(HOME)/.local/bin
 	ln -sf $(PWD)/bin/tutor $(HOME)/.local/bin/tutor
-	ln -sf $(PWD)/bin/tutorvim $(HOME)/.local/bin/tutorvim
 	@if [ -f "$(PWD)/bin/lgcc" ]; then ln -sf $(PWD)/bin/lgcc $(HOME)/.local/bin/lgcc; fi
-	@echo "Installed tutor and tutorvim to $(HOME)/.local/bin/"
+	@echo "Installed tutor to $(HOME)/.local/bin/"
 
 clean:
 	@if [ -d "crates/lgcc" ]; then cd crates/lgcc && cargo clean; fi

@@ -846,8 +846,8 @@ def main(argv=None):
 
     # test
     p_test = subparsers.add_parser("test", help="Execute locked test harness and compute Autolab scoreboard metrics")
-    p_test.add_argument("--remote", choices=("godbolt", "bridge"), default=None,
-                       help="Compile+run via Compiler Explorer (godbolt) or browser bridge")
+    p_test.add_argument("--remote", choices=("godbolt",), default=None,
+                       help="Compile+run via Compiler Explorer (godbolt)")
     p_test.add_argument("problem_id", nargs="?", default=None, help="Problem ID (optional if inside workspace)")
     p_test.add_argument("--lang", default=None, help="Implementation language")
     p_test.add_argument("--submission-dir", default=None, help="Explicit directory containing solution to grade")
@@ -891,7 +891,7 @@ def main(argv=None):
 
     # slice
     p_slice = subparsers.add_parser("slice", help="Clean-room contract slicer: extract problem stub from real code")
-    p_slice.add_argument("file", help="Source file to slice (C++, Rust, Python, Lua)")
+    p_slice.add_argument("file", help="Source file to slice (C++, Rust, Python)")
     p_slice.add_argument("-o", "--output", help="Output file path for stub")
     p_slice.set_defaults(func=cmd_slice)
 

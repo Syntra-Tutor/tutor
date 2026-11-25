@@ -1,27 +1,19 @@
 """Remote compile-and-run for environments where a local g++ is too slow.
 
-Two transports share one request/response shape (Compiler Explorer's API):
-  - "godbolt": POST directly from this process.
-  - "bridge": ask the hosting page over the terminal (OSC 777); the page makes
-    the fetch, so the guest needs no network and the page controls the
-    destination and compiler flags.
+Transport:
+  - "godbolt": POST directly from this process to Compiler Explorer.
 """
-import base64
 import json
 import os
 import re
-import select
-import termios
 import time
 import urllib.request
-import uuid
-import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
 GODBOLT_URL = "https://godbolt.org/api/compiler/g132/compile"
 GODBOLT_FLAGS = "-O3 -std=c++20"
-MODES = ("godbolt", "bridge")
+MODES = ("godbolt",)
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _LOCAL_INCLUDE = re.compile(r'^\s*#\s*include\s+"([^"]+)"\s*$')
 CHUNK = 1000
@@ -106,44 +98,11 @@ def _direct(source: str, timeout: float) -> dict:
         return json.load(response)
 
 
-def _bridge(source: str, timeout: float) -> dict:
-    payload = base64.b64encode(zlib.compress(json.dumps({"source": source}).encode())).decode()
-    request_id = uuid.uuid4().hex[:8]
-    fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
-    saved = termios.tcgetattr(fd)
-    quiet = termios.tcgetattr(fd)
-    quiet[3] &= ~termios.ECHO
-    termios.tcsetattr(fd, termios.TCSADRAIN, quiet)
-    try:
-        termios.tcflush(fd, termios.TCIFLUSH)
-        os.write(fd, f"\033]777;tutor-remote:{request_id}:{payload}\007".encode())
-        deadline = time.monotonic() + timeout
-        buffer, chunks = b"", []
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
-                raise TimeoutError("The page did not answer the remote compile request in time.")
-            buffer += os.read(fd, 4096)
-            *lines, buffer = buffer.split(b"\n")
-            for raw in lines:
-                line = raw.decode(errors="replace").strip()
-                if not line.startswith(f"R:{request_id}:"):
-                    continue
-                kind, _, rest = line[len(f"R:{request_id}:"):].partition(":")
-                if kind == "d":
-                    chunks.append(rest)
-                elif kind == "e":
-                    raise RuntimeError(f"Remote compile failed: {rest}")
-                elif kind == "end":
-                    return json.loads(zlib.decompress(base64.b64decode("".join(chunks))))
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-        os.close(fd)
 
 
 def run_remote(source: str, mode: str, timeout: float) -> RemoteResult:
     if mode not in MODES:
         raise ValueError(f"Unknown remote mode {mode!r}; expected one of {MODES}")
     start = time.perf_counter()
-    data = (_direct if mode == "godbolt" else _bridge)(source, timeout)
+    data = _direct(source, timeout)
     return parse_response(data, (time.perf_counter() - start) * 1000.0)

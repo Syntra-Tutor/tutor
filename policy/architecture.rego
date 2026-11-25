@@ -27,12 +27,7 @@ allow if {
 
 # Declared system components and boundaries
 components := {
-    "web_studio": {
-        "tier": "frontend",
-        "runtime": "Browser (WebAssembly)",
-        "tech": ["Neovim WASM (Asyncify)", "v86 Linux 5.6 WASM", "Compiler Explorer API"],
-        "purpose": "Zero-install client-side editing, local test execution, and 1-click PR creation."
-    },
+
     "cli_engine": {
         "tier": "cli_and_local_server",
         "runtime": "Host Python 3.10+ / Linux",
